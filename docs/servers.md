@@ -158,15 +158,24 @@ Laptop browsing is available in one panel at a time. To copy from it, select fil
 folders, choose a destination on the session's machine in the other panel, and press `c`
 or `F5`. To copy to the laptop, select files on the session's machine and choose the laptop
 as the destination in the other panel. The local permission covers listing and copying in
-both directions. Replacing anything on the laptop always asks in the laptop client's own
-box, including with Always. Approved folders are replaced in full. Cancel keeps the existing items. The client checks actual
+both directions. Press `m` or `F6` to move the selection to the other panel, or `d`, `Delete`
+or `F8` to delete the laptop selection for good. Deleting, moving files away or replacing
+anything on the laptop always asks in the laptop client's own box, including with Always.
+Moving to the laptop first asks to remove the sources on the session machine.
+Approved folders are replaced in full. Cancel keeps the existing items. The client checks actual
 names, including case-insensitive names on macOS. A name taken after approval stays staged
 and is named in the failed transfer window.
 
 The usual transfer window shows the announced total and received bytes. Closing that window
 cancels. Chunks are 64 KiB with acknowledgements and at most 256 KiB in flight; 30 seconds
 without transfer progress fails the copy. A lost connection also fails it, without resuming.
-Reconnect and copy again. The source originals stay untouched, even if installation fails.
+For a copy, reconnect and copy again; source originals stay untouched. For a move, check
+both locations before retrying. Sources are removed only after the entire selection is
+installed, and only if their device, inode, size and modification time (including nanoseconds)
+still match what was read. A changed source is kept and named in the error. If installation
+fails or the connection is lost before it is acknowledged, no source removal starts. An
+interruption during removal can leave some sources removed and others kept; installed copies
+remain at the destination.
 
 The receiving job checks the announced total against free space in its private spool and the
 destination before accepting contents. There is no per-file size limit; recursive copies
@@ -180,8 +189,9 @@ For copies from the laptop, the job receives into a private spool under `~/.loca
 handling to install it. The spool is removed when the job ends; abandoned spools are removed
 on session startup. If an installation race leaves files in staging, the failed transfer
 window names that staging directory. Check that message and the destination before retrying.
-The client shows a local notice for four seconds when the copy finishes or fails.
-The laptop destination panel refreshes after the transfer.
+The client shows a local notice for four seconds when an operation finishes or fails, such
+as **anvil copied 3 items to ~/Downloads**. Notices use the client's name for the server.
+The affected laptop panel refreshes after a copy, move or deletion.
 
 For copies into the laptop, the job reads without following links and the client writes
 into a private `.kraal-stage-*` directory in the destination, in `kraal-stage 2` format.
@@ -192,9 +202,13 @@ path; if a replacement raced, its previous item can also be kept in `work`. Chec
 names before copying again. Incoming link chains must stay inside the laptop scope; loops and escapes are refused.
 Links are preserved as links, and no link is followed while writing.
 
-Moving and deleting are **not yet available**. Copying between the
-laptop and an SSH server is unavailable: copy to the session's machine first, or run `kraal cp`
-on the laptop. Editing, previews and shells are unavailable on the laptop panel. There is no
+Deletion includes selected folder contents and nested hidden files. A symbolic link is
+unlinked without following its target, including a broken link or one pointing outside
+the scope. FIFOs and devices are skipped; a folder containing them stays and is named in
+the error. The home directory itself cannot be removed. Cancel keeps the selected items.
+
+Transfers between the laptop and an SSH server are unavailable: copy to the session's
+machine first, or run `kraal cp` on the laptop. Editing, previews and shells are unavailable on the laptop panel. There is no
 laptop path syntax in `kraal files`, `kraal cp` or ordinary control requests.
 
 In a local session, pasted paths stay unchanged, including in an SSH pane. Use **Upload to
@@ -301,7 +315,7 @@ remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 
-To browse this laptop or copy files between it and the session machine, open the
+To browse this laptop or transfer files between it and the session machine, open the
 [file manager](#the-file-manager) and choose it with `o`.
 Its local consent is separate from attachment and clipboard permissions.
 

@@ -844,6 +844,7 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["kraal", "laptop-cp"]).unwrap().command, Some(Cmd::LaptopCp)));
         assert!(Cli::try_parse_from(["kraal", "laptop-cp", "~/secret", "/destination"]).is_err());
         let spec = crate::laptop::copy::Spec {
+            operation: crate::laptop::copy::Operation::Copy,
             to_laptop: false,
             sources: vec!["~/-file with 'quotes'".into()],
             destination: "/destination".into(),

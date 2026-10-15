@@ -486,7 +486,7 @@ impl Server {
 }
 
 /// What a file operation acts on: the place, or the items by name.
-fn describe(locs: &[Location]) -> String {
+pub(super) fn describe(locs: &[Location]) -> String {
     match locs {
         [one] => one.display(),
         many => {

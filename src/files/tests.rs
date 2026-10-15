@@ -1124,7 +1124,7 @@ fn laptop_chunks_publish_only_complete_current_listings_and_discard_aborted_byte
 }
 
 #[test]
-fn laptop_actions_are_explicitly_refused_and_only_one_panel_can_use_it() {
+fn laptop_transfers_and_delete_work_but_editing_is_refused_and_only_one_panel_can_use_it() {
     let mut pane = offline(local(LEFT), local(RIGHT));
     pane.set_viewer(7);
     assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
@@ -1136,8 +1136,13 @@ fn laptop_actions_are_explicitly_refused_and_only_one_panel_can_use_it() {
             matches!(pane.key(key), FilesAction::Copy { sources, dest: Location::Local(_), .. } if sources == vec![laptop("~/note.txt")])
         );
     }
-    for key in [FileKey::Char('m'), FileKey::Char('d'), FileKey::F(6), FileKey::F(8)] {
-        assert!(matches!(pane.key(key), FilesAction::Refused(why) if why.contains("not yet")));
+    for key in [FileKey::Char('m'), FileKey::F(6)] {
+        assert!(
+            matches!(pane.key(key), FilesAction::Move { sources, dest: Location::Local(_), .. } if sources == vec![laptop("~/note.txt")])
+        );
+    }
+    for key in [FileKey::Char('d'), FileKey::Delete, FileKey::F(8)] {
+        assert!(matches!(pane.key(key), FilesAction::Delete(sources) if sources == vec![laptop("~/note.txt")]));
     }
     for key in [FileKey::Char('e'), FileKey::Char('s'), FileKey::Enter, FileKey::F(3)] {
         assert!(matches!(pane.key(key), FilesAction::Refused(_)));

@@ -1,6 +1,6 @@
-# Choose which laptop directories a remote file manager can list and copy to or from.
+# Choose which laptop directories a remote file manager can browse and transfer to or from.
 # Needs ssh access to a session through kraal attach --host.
-# Replacing laptop items always asks in the client, including with Always.
+# Deleting, moving away or replacing laptop items always asks locally, even with Always.
 # Put this in config.toml on the laptop. Permission is still asked locally.
 [laptop_files]
 # "home" excludes hidden top-level entries and ~/Library on macOS.

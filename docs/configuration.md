@@ -163,10 +163,11 @@ Larger or recursive transfers use `kraal cp`. See
 ## Laptop files
 
 This setting belongs to the laptop running `attach --host`. It is read again for each file
-manager listing or copy request. The local client asks for permission before listing or
+manager request. The local client asks for permission before listing or
 reading or writing anything. Permission to copy works between the laptop and the session
-machine in both directions. Replacing an item on the laptop always asks in the local client
-box, even with Always.
+machine in both directions. Deleting, moving files away or replacing an item on the laptop
+always asks in the local client box, even with Always. Moving to the laptop asks locally
+if it replaces existing items.
 
 ```toml config
 [laptop_files]
@@ -179,7 +180,7 @@ Hidden files in deeper directories follow the file manager's `.` key. All allows
 anywhere your user can access; off refuses every request, including remembered permissions.
 Neither enabled scope follows symbolic links when opening directories or files. Copies preserve
 links whose targets resolve inside the scope and refuse links that escape it. An unreadable
-or invalid config refuses both listing and copying. A selected folder is copied recursively,
+or invalid config refuses listing and all file operations. A selected folder is copied recursively,
 including its nested hidden files.
 
 **Allow** lasts for the current attach, including reconnects. **Always** stores a `[[laptop_copy]]`
