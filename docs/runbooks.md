@@ -46,6 +46,9 @@ pane of the run stops what has not started; servers already running finish. Each
 `~/.local/state/kraal/runs/`: who, where, parameters, steps, and everything each server printed
 (written as it comes, colours removed, a progress bar in its last state), with the result. If kraal
 stops in the middle, the next start says in the log which servers were left unfinished.
+Before any target starts, kraal records the run in its ledger. The session stays responsive
+while that write is pending. If the run cannot be recorded, nothing starts and the caller
+receives the error.
 Parameters marked `secret = true` are masked in plans, logs and events, and reach the command
 without going through a command line, the saved session or ssh's arguments (on a server, through
 ssh's input into a private file the command deletes); what the command itself prints is logged as
