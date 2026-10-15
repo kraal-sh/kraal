@@ -432,8 +432,7 @@ const MAX_MESSAGES: usize = 200;
 
 /// A control request waiting for a pane condition.
 struct PendingWait {
-    client: ClientId,
-    out: clients::Outbox,
+    reply: requests::ReplyHandle,
     pane: PaneId,
     until: Vec<String>,
     deadline: Option<Instant>,
@@ -489,7 +488,7 @@ pub struct Server {
     settle: Option<Instant>,
     quitting: bool,
     /// `kraal kill` requests, answered once the last state is written (or not).
-    kill_waiters: Vec<ClientId>,
+    kill_waiters: Vec<requests::ReplyHandle>,
     /// The server stops for `kraal restart`: attached clients wait for the next one.
     restarting: bool,
     /// Colours of the outer terminal, learnt from OSC 10/11 replies.
@@ -1989,9 +1988,8 @@ impl Server {
             Ok(()) => Ok(crate::protocol::Response::Ok),
             Err(e) => Ok(crate::protocol::Response::Text(e)),
         };
-        for id in std::mem::take(&mut self.kill_waiters) {
-            self.send_msg(id, &ServerMsg::Response { result: answer.clone() });
-            self.clients.remove(&id);
+        for reply in std::mem::take(&mut self.kill_waiters) {
+            reply.complete(self, answer.clone());
         }
         self.interrupt_runs();
         // What the runs wrote is in their logs before the server goes.

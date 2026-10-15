@@ -8,8 +8,9 @@ use anyhow::{Context, Result, bail};
 
 use super::{Draft, PLAN_LIFETIME, Target, first_line, list_choices};
 use crate::layout::PaneId;
-use crate::protocol::{Response, ServerMsg};
+use crate::protocol::Response;
 use crate::runbooks::{self, Body, On, Source};
+use crate::server::requests::ReplyHandle;
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
 use crate::theme::NoticeKind;
@@ -323,7 +324,7 @@ impl Server {
             self.toast(client, NoticeKind::Notice, "runbook cancelled");
             return;
         }
-        if let Err(e) = self.launch_runbook(d, super::Asker { client: Some(client), reply: None }) {
+        if let Err(e) = self.launch_runbook(d, &mut super::Asker { client: Some(client), reply: None }) {
             self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
     }
@@ -341,7 +342,7 @@ impl Server {
         target: Option<&str>,
         params: Vec<(String, String)>,
         pane: Option<PaneId>,
-        reply: ClientId,
+        reply: &mut Option<ReplyHandle>,
     ) -> Result<()> {
         let r = runbooks::load(path, runbooks::source_of(path))?;
         let Body::Steps(steps) = &r.body else {
@@ -380,10 +381,10 @@ impl Server {
         if !d.trusted {
             let why = "its choices are listed once the runbook is approved";
             let waiting = d.listed().iter().map(|(p, ..)| format!("{} is taken as given: {why}", p.name)).collect();
-            self.send_plan(reply, d, waiting);
+            self.send_plan(reply.take().unwrap(), d, waiting);
             return Ok(());
         }
-        self.hold_to_listed(d, move |server, held| match held {
+        self.hold_to_listed(d, reply, move |server, reply, held| match held {
             Ok((d, unchecked)) => server.send_plan(reply, d, unchecked),
             Err(e) => server.answer_runbook(reply, Err(e)),
         })
@@ -396,15 +397,17 @@ impl Server {
     fn hold_to_listed(
         &mut self,
         d: Draft,
-        then: impl FnOnce(&mut Server, Result<(Draft, Vec<String>)>) + 'static,
+        reply: &mut Option<ReplyHandle>,
+        then: impl FnOnce(&mut Server, ReplyHandle, Result<(Draft, Vec<String>)>) + 'static,
     ) -> Result<()> {
         let listed = d.listed();
         if listed.is_empty() {
-            then(self, Ok((d, Vec::new())));
+            then(self, reply.take().unwrap(), Ok((d, Vec::new())));
             return Ok(());
         }
         let (name, cwd, vars) = (d.runbook.name.clone(), self.draft_cwd(&d), self.draft_vars(&d));
-        let started = self.background(
+        let started = self.background_owned(
+            reply.take().unwrap(),
             move || -> Result<Vec<String>> {
                 let mut unchecked = Vec::new();
                 for (p, cmd, value) in listed {
@@ -415,15 +418,18 @@ impl Server {
                 }
                 Ok(unchecked)
             },
-            move |server, held| then(server, held.map(|unchecked| (d, unchecked))),
+            move |server, reply, held| then(server, reply, held.map(|unchecked| (d, unchecked))),
         );
-        anyhow::ensure!(started, "cannot list the choices of {name}");
+        if let Err(returned) = started {
+            *reply = Some(returned);
+            bail!("cannot list the choices of {name}");
+        }
         Ok(())
     }
 
     /// Keep a draft resolved for the command line, for ten minutes, and send `reply` its plan:
     /// the text, which ends with what was not checked of its values, and the token that runs it.
-    fn send_plan(&mut self, reply: ClientId, mut d: Draft, unchecked: Vec<String>) {
+    fn send_plan(&mut self, reply: ReplyHandle, mut d: Draft, unchecked: Vec<String>) {
         let mut text = self.plan(&d, true);
         for line in unchecked {
             text.push('\n');
@@ -437,16 +443,15 @@ impl Server {
     }
 
     /// Answer the `kraal runbook run` that waits for its plan, or for its run to start.
-    fn answer_runbook(&mut self, reply: ClientId, answer: Result<Response>) {
-        self.send_msg(reply, &ServerMsg::Response { result: answer.map_err(|e| format!("{e:#}")) });
-        self.clients.remove(&reply);
+    fn answer_runbook(&mut self, reply: ReplyHandle, answer: Result<Response>) {
+        reply.complete(self, answer.map_err(|e| format!("{e:#}")));
     }
 
     /// Run a plan prepared by [`Server::prepare_runbook`] for the CLI client `reply`, which gets
     /// the run's number once its targets have started (or why they did not). Asking for a plan
     /// to run approves nothing (whoever asks may have shown it to nobody): a repository
     /// runbook runs if the version planned is approved by now.
-    pub(in crate::server) fn run_prepared(&mut self, token: &str, reply: ClientId) -> Result<()> {
+    pub(in crate::server) fn run_prepared(&mut self, token: &str, reply: &mut Option<ReplyHandle>) -> Result<()> {
         let (made, mut d) = self.plans.remove(token).context("no such plan: review the runbook again")?;
         if made.elapsed() > PLAN_LIFETIME {
             bail!("the plan is more than 10 minutes old: review the runbook again");
@@ -455,20 +460,79 @@ impl Server {
         // whether the commands that list choices ran for it.
         let listed = d.trusted;
         d.trusted = runbooks::trusted(&d.runbook);
-        let asker = super::Asker { client: None, reply: Some(reply) };
         // One that is still not approved is refused there, before any of its commands runs.
         if listed || !d.trusted {
-            return self.launch_runbook(d, asker);
+            let mut asker = super::Asker { client: None, reply: reply.take() };
+            let result = self.launch_runbook(d, &mut asker);
+            *reply = asker.reply;
+            return result;
         }
         // Approved since its plan: the values that waited for it are held to their lists now.
-        self.hold_to_listed(d, move |server, held| {
+        self.hold_to_listed(d, reply, move |server, reply, held| {
+            let mut asker = super::Asker { client: None, reply: Some(reply) };
             let launched = held.and_then(|(d, unchecked)| {
                 server.warnings.extend(unchecked.iter().map(|line| format!("{}: {line}", d.runbook.name)));
-                server.launch_runbook(d, asker)
+                server.launch_runbook(d, &mut asker)
             });
             if let Err(e) = launched {
-                server.answer_runbook(reply, Err(e));
+                server.answer_runbook(asker.reply.take().unwrap(), Err(e));
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Request;
+    use crate::server::requests::{
+        RequestOutcome,
+        tests::{finish_job, response},
+    };
+    use crate::server::tests::{client, server};
+
+    #[test]
+    fn runbook_plans_reply_once_after_choices_and_keep_start_failure_immediate() {
+        for mode in ["plain", "listed", "refused", "start failure", "disconnected"] {
+            let (tx, rx) = crate::server::event_channel(32);
+            let mut server = server(tx);
+            let dir = crate::testing::TempDir::new("reply-plan");
+            let mut content = String::from("steps = ['true']\n");
+            if mode != "plain" {
+                content.push_str("[[param]]\nname = 'VALUE'\ndefault = 'yes'\nchoices_command = 'printf yes'\n");
+            }
+            let path = dir.write("check.toml", content);
+            let (id, _peer) = client(&mut server);
+            let receive = server.clients.get_mut(&id).unwrap().out.capture();
+            crate::server::jobs::FAIL_START.set(mode == "start failure");
+            let params = if mode == "refused" { vec![("VALUE".into(), "no".into())] } else { vec![] };
+            let outcome = server.request(id, Request::RunbookPlan { path, target: None, params, pane: None });
+            if mode == "start failure" {
+                let RequestOutcome::Immediate { reply, result } = outcome else { panic!("start failure") };
+                assert!(receive.is_empty());
+                reply.complete(&mut server, result);
+                assert_eq!(response(&receive).unwrap_err(), "cannot list the choices of check");
+            } else {
+                assert!(matches!(outcome, RequestOutcome::Deferred));
+                if mode != "plain" {
+                    assert!(receive.is_empty());
+                    if mode == "disconnected" {
+                        server.drop_client(id);
+                    }
+                    finish_job(&mut server, &rx);
+                }
+                if mode == "refused" {
+                    assert_eq!(response(&receive).unwrap_err(), "VALUE=no is not one of its choices: yes");
+                } else if mode != "disconnected" {
+                    let Response::Plan { token, .. } = response(&receive).unwrap() else { panic!("plan") };
+                    assert!(server.plans.contains_key(&token));
+                } else {
+                    assert_eq!(server.plans.len(), 1);
+                }
+            }
+            assert!(server.jobs.is_empty());
+            assert!(!server.clients.contains_key(&id));
+            assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+        }
     }
 }
