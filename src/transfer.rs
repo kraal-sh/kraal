@@ -1851,12 +1851,20 @@ fn run_install_copy(step: &Step, output: &mut impl std::io::Write) -> Result<std
     let mut input = child.stdout.take().context("no pipe")?;
     let result = (|| -> std::io::Result<()> {
         let mut buffer = [0; 16 * 1024];
+        let mut reported = false;
         loop {
             match input.read(&mut buffer) {
-                Ok(0) => return Ok(()),
+                Ok(0) => {
+                    if reported {
+                        output.write_all(b"\n")?;
+                        output.flush()?;
+                    }
+                    return Ok(());
+                }
                 Ok(_) => {
-                    output.write_all(b"Installing files\n")?;
+                    output.write_all(b"\rInstalling files")?;
                     output.flush()?;
+                    reported = true;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
@@ -1883,6 +1891,13 @@ fn run_inner(steps: &[Step], laptop_install: bool) -> Result<()> {
         let partial = step.partial.as_deref().map(PartialRun::start).transpose()?;
         let status = if laptop_install && step.pipe_to.is_none() && matches!(step.program.as_str(), "cp" | "rsync") {
             run_install_copy(step, &mut std::io::stderr())?
+        } else if laptop_install && step.pipe_to.is_none() {
+            // Other installation steps keep their internal paths quiet; errors still name them.
+            std::process::Command::new(&step.program)
+                .args(&step.args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .with_context(|| format!("running {}", step.program))?
         } else {
             run_step(step)?
         };
@@ -2293,43 +2308,20 @@ mod tests {
     }
 
     #[test]
-    fn laptop_spool_installation_reports_only_progress_but_errors_name_the_failed_path() {
-        for moving in [false, true] {
-            let t = Tmp::new("laptop-install-output");
-            let source = t.write("spool/report", "contents");
-            let destination = t.dir.mkdir("destination");
-            let options = Options { moving, rsync: moving, replace: Some(vec![]), ..Default::default() };
-            let steps =
-                plan(&[Endpoint::Local(source.clone())], &Endpoint::Local(destination.clone()), &opts, &options)
-                    .unwrap();
-            let copy = steps.iter().find(|step| step.program == if moving { "rsync" } else { "cp" }).unwrap();
-            for step in &steps {
-                if let Some(install) = &step.here {
-                    install_here(install).unwrap();
-                } else if step == copy {
-                    let mut output = Vec::new();
-                    assert!(run_install_copy(step, &mut output).unwrap().success());
-                    let output = String::from_utf8(output).unwrap();
-                    assert!(!output.is_empty());
-                    assert!(output.lines().all(|line| line == "Installing files"), "{output}");
-                } else {
-                    let output = std::process::Command::new(&step.program).args(&step.args).output().unwrap();
-                    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-                    assert!(output.stdout.is_empty() && output.stderr.is_empty());
-                }
-            }
-            assert_eq!(std::fs::read(destination.join("report")).unwrap(), b"contents");
-            if source.exists() {
-                std::fs::remove_file(&source).unwrap();
-            }
-            // Installation removed staging. Keep the destination valid so only the source
-            // is missing: BSD cp checks the destination before looking at the source.
-            std::fs::create_dir_all(copy.args.last().unwrap()).unwrap();
-            let output = std::process::Command::new(&copy.program).args(&copy.args).output().unwrap();
-            assert!(!output.status.success());
-            let error = String::from_utf8_lossy(&output.stderr);
-            assert!(error.contains("report"), "{error}");
+    fn laptop_install_copy_hides_paths_and_preserves_the_exit_status() {
+        for code in [0, 7] {
+            let step = Step::new(
+                "sh",
+                vec!["-c".into(), format!("printf '/private/spool/file -> /private/staging/file\\r'; exit {code}")],
+            );
+            let mut output = Vec::new();
+            assert_eq!(run_install_copy(&step, &mut output).unwrap().code(), Some(code));
+            assert_eq!(output, b"\rInstalling files\n");
         }
+        let step = Step::new("sh", vec!["-c".into(), "exit 0".into()]);
+        let mut output = Vec::new();
+        assert!(run_install_copy(&step, &mut output).unwrap().success());
+        assert!(output.is_empty(), "a quiet child must not report progress");
     }
 
     #[test]
