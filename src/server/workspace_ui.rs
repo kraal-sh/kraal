@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::ui::{Mode, Picker, PickerKind, PickerState, Prompt, PromptAction};
+use super::ui::{Mode, Picker, PickerState, Prompt, PromptAction};
 use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
@@ -287,7 +287,7 @@ impl Server {
         let mut p = Prompt::new("Add workspace", &name, PromptAction::NewWorkspace);
         let form = p.workspace_form.as_mut().unwrap();
         form.cwd = self.workspace_form_cwd(id);
-        form.back = from.map(Picker::state);
+        form.back = from.and_then(Picker::form_back);
         p
     }
 
@@ -304,11 +304,11 @@ impl Server {
             return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
         };
         let mut p = Prompt::new("Rename workspace", &self.workspaces[wi].name, PromptAction::RenameWorkspace(ws));
-        p.workspace_form.as_mut().unwrap().back = from.map(Picker::state);
+        p.workspace_form.as_mut().unwrap().back = from.and_then(Picker::form_back);
         Mode::Prompt(p)
     }
 
-    pub(super) fn duplicate_workspace_form(&self, ws: u32, from: &Picker) -> Mode {
+    pub(super) fn duplicate_workspace_form(&self, ws: u32, from: Option<&Picker>) -> Mode {
         let Some(wi) = self.ws_index(ws) else {
             return self
                 .workspace_picker(0)
@@ -320,12 +320,12 @@ impl Server {
             .find(|n| !self.workspace_name_used(n, None, None))
             .unwrap();
         let mut p = Prompt::new("Duplicate workspace", &name, PromptAction::DuplicateWorkspace(ws));
-        p.workspace_form.as_mut().unwrap().back = Some(from.state());
+        p.workspace_form.as_mut().unwrap().back = from.and_then(Picker::form_back);
         Mode::Prompt(p)
     }
 
     pub(super) fn workspace_restore_back(&self, p: &mut Prompt, from: Option<&Picker>) {
-        p.workspace_form.as_mut().unwrap().back = from.map(Picker::state);
+        p.workspace_form.as_mut().unwrap().back = from.and_then(Picker::form_back);
     }
 
     pub(super) fn on_workspace_form(&mut self, id: ClientId, mut p: Prompt, event: InputEvent) -> Mode {
@@ -425,7 +425,7 @@ impl Server {
         );
         let form = p.workspace_form.as_mut().unwrap();
         form.field = 1;
-        form.back = from.map(Picker::state);
+        form.back = from.and_then(Picker::form_back);
         form.undo = undo;
         if undo {
             form.undo_layout = workspace.layout_undo.clone();
@@ -611,7 +611,7 @@ impl Server {
         let mut p = Prompt::new("Export layout", &file, PromptAction::ExportWorkspace(ws));
         let form = p.workspace_form.as_mut().unwrap();
         form.cwd = self.workspace_form_cwd(id);
-        form.back = from.map(Picker::state);
+        form.back = from.and_then(Picker::form_back);
         Mode::Prompt(p)
     }
 
@@ -654,15 +654,11 @@ impl Server {
     }
 
     pub(super) fn workspace_form_back(&self, id: ClientId, mut p: Prompt, renamed: Option<u32>) -> Mode {
-        let Some(state) = p.workspace_form.as_mut().and_then(|f| f.back.take()) else { return Mode::Normal };
-        let mut picker = if state.kind == PickerKind::DeletedWorkspaces {
-            self.deleted_workspace_picker()
-        } else {
-            self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace))
-        };
-        picker.restore(state);
+        let back = p.workspace_form.as_mut().and_then(|f| f.back.take());
+        let Mode::Picker(mut picker) = self.form_back(id, back.clone()) else { return Mode::Normal };
         if let Some(ws) = renamed {
             select_workspace(&mut picker, ws);
+            picker.close_to = back.map(Box::new);
             picker.result(NoticeKind::Notice, "Workspace renamed")
         } else {
             Mode::Picker(picker)
@@ -776,9 +772,11 @@ impl Server {
                     self.mark_dirty();
                     self.toast(id, NoticeKind::Notice, "Workspace duplicated");
                     let mut picker = self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace));
-                    if let Some(back) = p.workspace_form.as_mut().and_then(|f| f.back.take()) {
-                        picker.restore(back);
+                    let back = p.workspace_form.as_mut().and_then(|f| f.back.take());
+                    if let Some(state) = back.clone() {
+                        picker.restore(state);
                     }
+                    picker.close_to = back.map(Box::new);
                     select_workspace(&mut picker, ws);
                     picker.result(NoticeKind::Notice, "Workspace duplicated · Enter Open")
                 }
@@ -908,6 +906,72 @@ mod tests {
         server.clients.get_mut(&client).unwrap().mode = Mode::Confirm(q);
         server.client_input(client, bytes);
         std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+    }
+
+    fn click(area: Rect) -> InputEvent {
+        InputEvent::Mouse(MouseEvent {
+            kind: MouseKind::Press(MouseButton::Left),
+            col: area.x,
+            row: area.y,
+            mods: Default::default(),
+        })
+    }
+
+    #[test]
+    fn workspace_forms_and_export_close_return_to_their_origin() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        for size in [(80, 24), (124, 36)] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            for origin in 0..3 {
+                let mut list = server.workspace_picker(ws);
+                list.query = "tes".into();
+                list.cursor = 1;
+                list.refilter();
+                list.standalone_actions = origin == 1;
+                let from = (origin != 2).then_some(&list);
+                for operation in 0..6 {
+                    for leave in 0..3 {
+                        let mode = match operation {
+                            0 | 4 => Mode::Prompt(server.add_workspace_form(client, from)),
+                            1 => server.rename_workspace_form(ws, from),
+                            2 => server.duplicate_workspace_form(ws, from),
+                            _ => server.export_workspace_form(client, ws, from),
+                        };
+                        let Mode::Prompt(mut p) = mode else { panic!("expected a form") };
+                        if operation == 4 {
+                            let layout = form_layout(&p, server.client_screen(client));
+                            let Mode::Prompt(next) =
+                                server.on_workspace_form(client, p, click(layout.alternate.unwrap()))
+                            else {
+                                panic!()
+                            };
+                            p = next;
+                            assert!(matches!(p.action, PromptAction::ImportWorkspace));
+                        } else if operation == 5 {
+                            let Mode::Prompt(next) = server.exported_layout(p, std::path::Path::new("/tmp/layout.kdl"))
+                            else {
+                                panic!()
+                            };
+                            p = next;
+                        }
+                        let layout = form_layout(&p, server.client_screen(client));
+                        let event = match leave {
+                            0 => key("esc"),
+                            1 => click(layout.cancel),
+                            _ => {
+                                p.workspace_form.as_mut().unwrap().field = buttons(&p).cancel.field;
+                                key("enter")
+                            }
+                        };
+                        forms::assert_return(server.on_workspace_form(client, p, event), from);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1450,7 +1514,7 @@ mod tests {
         for size in [(80, 24), (124, 36)] {
             let c = server.clients.get_mut(&client).unwrap();
             (c.cols, c.rows) = size;
-            let Mode::Prompt(p) = server.duplicate_workspace_form(ws, &list) else { panic!() };
+            let Mode::Prompt(p) = server.duplicate_workspace_form(ws, Some(&list)) else { panic!() };
             assert_eq!(p.value, "test-copy-4");
             let mut buf = Buffer::empty(server.client_screen(client));
             draw_form(&p, buf.area, &mut buf);
@@ -1485,7 +1549,7 @@ mod tests {
             let mut list = server.workspace_picker(ws);
             list.query = "test".into();
             list.refilter();
-            let Mode::Prompt(mut p) = server.duplicate_workspace_form(ws, &list) else { panic!() };
+            let Mode::Prompt(mut p) = server.duplicate_workspace_form(ws, Some(&list)) else { panic!() };
             for value in ["", "test", "copy\n"] {
                 p.value = value.into();
                 let Mode::Prompt(next) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
@@ -1524,6 +1588,11 @@ mod tests {
             assert!(copy.closed());
             assert_eq!(server.clients[&client].workspace, ws);
             assert_eq!(saved.lock().unwrap().last().unwrap()["workspaces"][1]["name"], "independent");
+            server.clients.get_mut(&client).unwrap().mode = Mode::Picker(p);
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            let mode = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal);
+            forms::assert_return(mode, Some(&list));
         }
     }
 

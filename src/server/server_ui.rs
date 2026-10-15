@@ -89,7 +89,7 @@ impl Server {
         form.cursor = address.chars().count();
         form.address = address;
         form.suggested = suggested.cloned();
-        form.back = from.map(Picker::state);
+        form.back = from.and_then(Picker::form_back);
         self.suggest_server_name(&mut p);
         p
     }
@@ -98,17 +98,6 @@ impl Server {
         if !p.server_form.as_ref().unwrap().named {
             p.value = target(p, &self.known_servers).map_or_else(String::new, |s| s.name.replace(':', "-"));
             p.cursor = p.value.chars().count();
-        }
-    }
-
-    fn server_form_back(&self, p: &mut Prompt) -> Mode {
-        match p.server_form.as_mut().and_then(|f| f.back.take()) {
-            Some(state) => {
-                let mut picker = self.ssh_picker();
-                picker.restore(state);
-                Mode::Picker(picker)
-            }
-            None => Mode::Normal,
         }
     }
 
@@ -148,7 +137,7 @@ impl Server {
             self.suggest_server_name(&mut p);
         }
         match outcome {
-            forms::FormEvent::Cancel => self.server_form_back(&mut p),
+            forms::FormEvent::Cancel => self.form_back(id, p.server_form.as_mut().unwrap().back.take()),
             forms::FormEvent::Submit => self.submit_server_form(id, p),
             _ => Mode::Prompt(p),
         }
@@ -208,9 +197,11 @@ impl Server {
         let mode = match result {
             Ok((name, added)) => {
                 let mut picker = self.ssh_picker();
-                if let Some(back) = p.server_form.as_mut().unwrap().back.take() {
-                    picker.restore(back);
+                let back = p.server_form.as_mut().unwrap().back.take();
+                if let Some(state) = back.clone() {
+                    picker.restore(state);
                 }
+                picker.close_to = back.map(Box::new);
                 if !picker.filtered.iter().any(|&i| picker.items[i].label == name) {
                     picker.query.clear();
                     picker.cursor = 0;
@@ -249,6 +240,43 @@ mod tests {
             row: area.y,
             mods: Default::default(),
         })
+    }
+
+    #[test]
+    fn server_cancel_and_saved_result_close_return_to_the_origin() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for origin in 0..3 {
+            let mut list = server.ssh_picker();
+            list.query = "db".into();
+            list.cursor = 1;
+            list.refilter();
+            list.select(|i| matches!(i.action, super::super::ui::PickAction::AddServer(None)));
+            list.standalone_actions = origin == 1;
+            let from = (origin != 2).then_some(&list);
+            for leave in 0..3 {
+                let mut p = server.add_server_form(from, None);
+                let layout = form_layout(&p, server.client_screen(client));
+                let event = match leave {
+                    0 => key("esc"),
+                    1 => click(layout.cancel),
+                    _ => {
+                        p.server_form.as_mut().unwrap().field = buttons(&p).cancel.field;
+                        key("enter")
+                    }
+                };
+                forms::assert_return(server.on_server_form(client, p, event), from);
+                let mut p = server.add_server_form(from, None);
+                p.server_form.as_mut().unwrap().pending = Some(42);
+                server.clients.get_mut(&client).unwrap().mode = Mode::Prompt(p);
+                server.server_form_saved(client, 42, Ok(("db".into(), true)));
+                server.client_input(client, b"\x1b");
+                server.flush_client_input(client);
+                let mode = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal);
+                forms::assert_return(mode, from);
+            }
+        }
     }
 
     #[test]

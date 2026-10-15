@@ -77,7 +77,8 @@ Adding saves locally without starting SSH. The list returns with **Server added*
 row selected, and **Enter Connect** as a separate action. An already saved connection returns
 **Server already saved** without changing it. A conflicting name or SSH configuration stays
 in the form with a next step. A save failure keeps both fields for Retry. Cancel returns to
-the previous list and selection; the direct shortcut returns to the pane. Closing while a save
+the previous list, search and selection; the command palette and direct shortcut return to the
+panes. Closing the result follows the same return path. Closing while a save
 is already running lets that save finish and reports its result.
 
 On a server row, Enter connects (or opens a whole group); Tab shows the other
@@ -218,13 +219,14 @@ The form shows **Server**, **Remote** (`[host:]port`) and **Local**. Local follo
 port until you edit it. Enter or **Add** starts the connection on exactly the shown local port.
 If it is occupied, the form keeps your values and offers **Use PORT**. That button updates
 Local; **Add** then submits the chosen port. No port changes silently. Tab moves between
-fields and buttons; Esc or **Cancel** returns to the previous list with its selection intact.
+fields and buttons; Esc or **Cancel** returns to the previous list with its search and selection
+intact when opened from that list, or to the panes when opened directly.
 
 Adding selects the tunnel in **Tunnels**, showing **Connecting**, then **Ready** only once
 SSH confirms its local listener, or **Error** with the reason. Enter or a click opens details;
 Tab opens the row's actions. Details keep the error and show the time until the next automatic
 retry, with **Close** selected, **Retry now** and **Stop** reachable by keyboard or mouse.
-**Stop** is also available while connecting or ready. Close returns to the list and leaves
+**Stop** is also available while connecting or ready. Close uses the same return path and leaves
 the tunnel running. Stop removes it and cancels retries. Tunnels come back after a restart
 and reconnect when the network drops. The sidebar shows their state; clicking one opens details.
 

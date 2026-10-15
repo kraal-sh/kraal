@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 
 use super::panes::ProgramStop;
 use super::persistence::ClosePane;
-use super::ui::{ConfirmAction, Mode, Prompt, PromptAction};
+use super::ui::{ConfirmAction, Mode, Picker, PickerState, Prompt, PromptAction};
 use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
@@ -18,6 +18,7 @@ use crate::theme::NoticeKind;
 
 pub struct PaneForm {
     pane: PaneId,
+    back: Option<PickerState>,
     values: [String; 3],
     cursors: [usize; 3],
     field: usize,
@@ -92,14 +93,13 @@ impl Server {
         }
     }
 
-    pub(super) fn edit_pane_form(&mut self, client: ClientId, pane: PaneId) -> Mode {
+    pub(super) fn edit_pane_form(&mut self, client: ClientId, pane: PaneId, from: Option<&Picker>) -> Mode {
         let Some(p) = self.panes.get(&pane) else { return Mode::Normal };
         if !p.is_terminal() || p.spec.login.is_some() {
-            return Mode::Prompt(Prompt::new(
-                "Rename pane",
-                p.name.as_deref().unwrap_or(""),
-                PromptAction::RenamePane(pane),
-            ));
+            let mut prompt =
+                Prompt::new("Rename pane", p.name.as_deref().unwrap_or(""), PromptAction::RenamePane(pane));
+            prompt.back = from.and_then(Picker::form_back);
+            return Mode::Prompt(prompt);
         }
         if self.pane_edits.contains_key(&pane) {
             self.toast(client, NoticeKind::Notice, "Applying pane changes. Waiting for its programs to stop.");
@@ -110,6 +110,7 @@ impl Server {
         let values = [p.name.clone().unwrap_or_default(), crate::paths::shorten_home(&folder), command_text(&p.spec)];
         Mode::PaneForm(Box::new(PaneForm {
             pane,
+            back: from.and_then(Picker::form_back),
             cursors: values.each_ref().map(|s| s.chars().count()),
             values,
             field: 0,
@@ -145,7 +146,7 @@ impl Server {
         }
         .handle(event, &mut fields, &buttons(), &layout);
         match outcome {
-            forms::FormEvent::Cancel => Mode::Normal,
+            forms::FormEvent::Cancel => self.form_back(client, form.back),
             forms::FormEvent::Submit => self.submit_pane_form(client, form, false),
             _ => Mode::PaneForm(Box::new(form)),
         }
@@ -491,7 +492,7 @@ mod tests {
         }
 
         fn form(&mut self) -> PaneForm {
-            let Mode::PaneForm(form) = self.server.edit_pane_form(self.client, self.pane) else { panic!("form") };
+            let Mode::PaneForm(form) = self.server.edit_pane_form(self.client, self.pane, None) else { panic!("form") };
             *form
         }
 
@@ -563,6 +564,63 @@ mod tests {
     fn form(mode: Mode) -> PaneForm {
         let Mode::PaneForm(form) = mode else { panic!("form") };
         *form
+    }
+
+    #[test]
+    fn pane_edit_cancel_returns_to_its_list_or_the_panes() {
+        let mut t = EditTest::new(true);
+        t.pane = t
+            .server
+            .spawn_pane_in(
+                t.server.clients[&t.client].workspace,
+                None,
+                t.server.panes[&t.pane].spec.clone(),
+                crate::protocol::Placement::Auto,
+                Some("tests".into()),
+            )
+            .unwrap();
+        for origin in 0..3 {
+            let mut list = t.server.pane_picker();
+            list.query = "test".into();
+            list.cursor = 2;
+            list.refilter();
+            assert_eq!(list.filtered.len(), 2);
+            assert_eq!(list.items[list.filtered[0]].label, list.items[list.filtered[1]].label);
+            list.select(|i| matches!(i.action, super::super::ui::PickAction::FocusPane { pane, .. } if pane == t.pane));
+            assert_eq!(list.selected, 1);
+            list.standalone_actions = origin == 1;
+            let from = (origin != 2).then_some(&list);
+            for leave in 0..3 {
+                let mode = if origin == 0 {
+                    let mut picker = t.server.pane_picker();
+                    picker.restore(list.state());
+                    assert!(picker.action_keys().contains(&("ctrl+e", "Edit pane")));
+                    t.server.clients.get_mut(&t.client).unwrap().mode = Mode::Picker(picker);
+                    t.server.client_input(t.client, b"\x05");
+                    std::mem::replace(&mut t.server.clients.get_mut(&t.client).unwrap().mode, Mode::Normal)
+                } else {
+                    t.server.edit_pane_form(t.client, t.pane, from)
+                };
+                let Mode::PaneForm(mut form) = mode else { panic!() };
+                form.values[0] = "discarded name".into();
+                let layout = form_layout(&form, t.server.client_screen(t.client));
+                let event = match leave {
+                    0 => key("esc"),
+                    1 => InputEvent::Mouse(MouseEvent {
+                        kind: MouseKind::Press(MouseButton::Left),
+                        col: layout.cancel.x,
+                        row: layout.cancel.y,
+                        mods: Default::default(),
+                    }),
+                    _ => {
+                        form.field = buttons().cancel.field;
+                        key("enter")
+                    }
+                };
+                forms::assert_return(t.server.on_pane_form(t.client, *form, event), from);
+                assert_eq!(t.server.panes[&t.pane].name.as_deref(), Some("tests"));
+            }
+        }
     }
 
     #[test]
@@ -1230,7 +1288,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(t.server.edit_pane_form(t.client, pane), Mode::Prompt(p) if matches!(p.action, PromptAction::RenamePane(id) if id == pane))
+            matches!(t.server.edit_pane_form(t.client, pane, None), Mode::Prompt(p) if matches!(p.action, PromptAction::RenamePane(id) if id == pane))
         );
     }
 

@@ -497,7 +497,7 @@ fn codex_undo_from_pane_actions_reopens_the_original_and_keeps_the_new_conversat
     client.send(b"\x02p");
     client.send(b"codex\t");
     client.wait_for_row("Undo account change");
-    client.send(b"\x1b[B\x1b[B\r");
+    click_account_text(&mut client, "Undo account change");
     client.wait_for_row("Stop and switch?");
     client.wait_for_row("Continue conversation");
     client.send(b"y");
@@ -1613,7 +1613,12 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         client.wait_for_row("Use patron.bzh?");
         client.send(b"y");
         client.wait_for_row("Account updated");
-        client.send(b"\x1b");
+        if size.0 == 80 {
+            client.send(b"\x1b");
+            client.close_overlay("Search  Which account is");
+        } else {
+            client.close_overlay("Enter Details");
+        }
         env.run(&["send", "-p", &pane, "still-here\r"]);
         env.wait_for_text(&pane, "reply:still-here");
         assert_eq!(std::fs::read_to_string(standard.join("starts")).unwrap().lines().count(), 1);
@@ -1747,16 +1752,15 @@ fn a_missing_agent_keeps_the_add_form_and_creates_nothing() {
     let file = env.root.join("config/kraal/accounts.toml");
     assert!(!std::fs::read_to_string(file).unwrap_or_default().contains("unfinished"));
     client.close_overlay("Name    unfinished");
-    client.wait_for_row("+ Add account");
-    client.close_overlay("Enter Add account");
+    assert!(!client.rows().iter().any(|r| r.contains("Enter Add account") || r.contains("Enter Details")));
     client.send(b"\x02An\x1b[Z\x1b[C");
     client.wait_for_row("Agent   Codex");
     client.close_overlay("Agent   Codex");
-    client.close_overlay("Enter Add account");
+    assert!(!client.rows().iter().any(|r| r.contains("Enter Add account") || r.contains("Enter Details")));
     client.send(b"\x02An");
     client.wait_for_row("Agent   Codex");
     client.close_overlay("Agent   Codex");
-    client.close_overlay("Enter Add account");
+    assert!(!client.rows().iter().any(|r| r.contains("Enter Add account") || r.contains("Enter Details")));
     client.send(b"\x02a");
     let rows = client.wait_for_row("No accounts ready.");
     assert!(!rows.iter().any(|r| r.contains("Add account")));
@@ -2083,7 +2087,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
             client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("Enter Details")));
             click_account_text(&mut client, "No usage yet · 1 pane");
             client.wait_for_row("Enter Back · Tab Actions");
-            client.send(b"\r\x1b");
+            client.send(b"\r");
             client.wait_for_rows("Details closed", |rows| {
                 !rows.iter().any(|r| r.contains("Enter Back") || r.contains("Enter Details"))
             });
@@ -2135,6 +2139,8 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         assert_eq!(launched.as_array().unwrap().iter().filter(|p| p["account"] == "codex:second").count(), 1);
         client.send(b"\x02Al");
         client.wait_for_row("Enter Details");
+        client.send(b"second");
+        client.wait_for_row("1/2");
         click_account_text(&mut client, "Codex · second");
         client.wait_for_row("Enter Back · Tab Actions");
         client.send(b"\t");
@@ -2144,6 +2150,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         client.wait_for_row("Codex · renamed");
         client.send(b"\r");
         client.wait_for_row("Enter Back · Tab Actions");
+        client.wait_for_row("╭ Codex · renamed");
         client.send(b"\x1b");
         client.wait_for_row("Enter Details");
         click_account_text(&mut client, "Codex · work");

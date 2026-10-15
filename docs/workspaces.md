@@ -43,8 +43,11 @@ Close appears only while open. Sidebar status omits trailing parts that do not f
 **+ Add workspace** and `ctrl+b W n` open the same **Add workspace** form. It proposes an unused
 name (or the search text) and shows the folder inherited from the current pane. Edit **Name**,
 then Enter or click **Add**. **Add**, **From file...** and **Cancel** share one row when they fit.
-Tab moves between the field and buttons; Esc or **Cancel** returns
-to the list with its search and selection. A direct shortcut returns to the terminal.
+Tab moves between the field and buttons. Esc or **Cancel** returns to the list with its search
+and selection when the form was opened from that list. From the sidebar
+(**+ Add workspace** or a row's actions), command palette or a direct shortcut, it closes to
+the panes. Add, Rename, Duplicate, From file and Export layout use this same return path,
+including **Close** on a result.
 Add, Rename, Duplicate, Restore and import use the same name rules, including from the command
 line: names cannot be empty, contain control characters (such as tabs or newlines), or be taken
 by another workspace. Spaces, Unicode, `/` and leading dots are allowed. Names are checked
@@ -118,7 +121,8 @@ no longer matches the search, the search clears to show it.
 
 Select an open or closed saved workspace, press Tab and choose **Duplicate**. The shared Name
 form proposes an unused name: `api-copy`, then `api-copy-2`, and so on. Edit it if needed and
-press Enter or click **Duplicate**. Esc or **Cancel** returns to the same search and selection.
+press Enter or click **Duplicate**. Esc or **Cancel** returns to the same search and selection
+from the list, or to the panes from sidebar actions.
 An invalid or taken name stays in the form so you can correct it.
 
 The result selects the new **Closed** workspace and says **Workspace duplicated · Enter Open**.
@@ -201,7 +205,9 @@ pipes; an empty Command starts your configured shell. Unchanged commands retain 
 arguments and launch settings.
 
 Enter or **Apply** submits the form; Tab and Shift+Tab move between fields and buttons. Fields
-and buttons also accept clicks. Esc or **Cancel** leaves the pane unchanged. An invalid folder
+and buttons also accept clicks. In the Panes list, **Edit pane** (`ctrl+e`) edits the selected pane.
+Esc or **Cancel** leaves the pane unchanged and returns to that list with its search and selection,
+or to the panes when opened directly. An invalid folder
 or command syntax keeps all the entered values with a correction to make. Long errors wrap and
 scroll with PageUp/PageDown or the mouse wheel at both 80x24 and 124x36.
 

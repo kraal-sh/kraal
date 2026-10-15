@@ -8,7 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
-use super::ui::{Mode, PickAction, PickItem, Picker, PickerKind};
+use super::ui::{Mode, PickAction, PickItem, Picker, PickerKind, PickerState};
 use super::{ClientId, Server, forms, overlays};
 use crate::account_status::{self, Status};
 use crate::accounts::{self, Account, Accounts, Usage};
@@ -68,6 +68,7 @@ pub struct AccountForm {
     pub error: Option<String>,
     pub scroll: usize,
     pub checking: Option<u32>,
+    pub back: Option<PickerState>,
 }
 
 impl AccountForm {
@@ -87,6 +88,7 @@ impl AccountForm {
 
 pub struct AccountDetails {
     pub account: String,
+    pub back: Option<PickerState>,
     pub title: String,
     pub text: String,
     pub scroll: usize,
@@ -304,7 +306,7 @@ impl Server {
         self.usage.next_end(now).into_iter().chain(ages).min()
     }
 
-    pub(super) fn account_details(&self, id: &str) -> Mode {
+    pub(super) fn account_details(&self, id: &str, from: Option<&Picker>) -> Mode {
         let Some(a) = self.accounts.by_id(id) else { return Mode::Picker(self.accounts_picker(None)) };
         let now = accounts::now();
         let mut text = self.account_summary(&a);
@@ -327,7 +329,13 @@ impl Server {
                 text.push_str(&format!("\n{name}: {detail}"));
             }
         }
-        Mode::AccountDetails(AccountDetails { account: a.id.clone(), title: label(&a), text, scroll: 0 })
+        Mode::AccountDetails(AccountDetails {
+            account: a.id.clone(),
+            back: from.and_then(Picker::form_back),
+            title: label(&a),
+            text,
+            scroll: 0,
+        })
     }
 
     pub(super) fn account_form(&self, client: ClientId) -> AccountForm {
@@ -350,6 +358,7 @@ impl Server {
             error: None,
             scroll: 0,
             checking: None,
+            back: None,
         };
         self.fill_account_form(&mut form);
         form
@@ -392,8 +401,10 @@ impl Server {
         form
     }
 
-    fn account_added(&mut self, client: ClientId, account: &Account) {
-        let result = self.accounts_picker(Some(&account.id)).result(NoticeKind::Notice, "Account added");
+    fn account_added(&mut self, client: ClientId, account: &Account, back: Option<PickerState>) {
+        let mut picker = self.accounts_picker(Some(&account.id));
+        picker.close_to = back.map(Box::new);
+        let result = picker.result(NoticeKind::Notice, "Account added");
         if let Some(c) = self.clients.get_mut(&client) {
             c.mode = result;
         }
@@ -424,7 +435,7 @@ impl Server {
                 let mut form = saved_form;
                 form.state().complete(token, result.as_ref().err().map(|e| format!("{e:#}")));
                 match result {
-                    Ok(a) => server.account_added(client, &a),
+                    Ok(a) => server.account_added(client, &a, form.back),
                     Err(_) => {
                         server.clients.get_mut(&client).unwrap().mode = Mode::AccountForm(form);
                         server.mark_dirty();
@@ -457,7 +468,7 @@ impl Server {
         .handle(event, &mut fields, &buttons, &layout);
         if form.checking.is_some() {
             return if matches!(outcome, forms::FormEvent::Cancel) {
-                Mode::Picker(self.accounts_picker(None))
+                self.form_back(client, form.back)
             } else {
                 Mode::AccountForm(form)
             };
@@ -475,7 +486,7 @@ impl Server {
             c.last_account_agent = Some(accounts::agents().nth(form.agent).unwrap().name.into());
         }
         if matches!(outcome, forms::FormEvent::Cancel) {
-            return Mode::Picker(self.accounts_picker(None));
+            return self.form_back(client, form.back);
         }
         if matches!(outcome, forms::FormEvent::Submit) {
             if form.choosing() {
@@ -487,9 +498,13 @@ impl Server {
                 }
                 let existing = form.existing.as_ref().unwrap();
                 if existing.review {
-                    return Mode::Picker(self.review_account_picker(existing));
+                    let mut picker = self.review_account_picker(existing);
+                    picker.close_to = form.back.map(Box::new);
+                    return Mode::Picker(picker);
                 }
-                return Mode::AccountForm(self.name_existing_form(client, existing.clone()));
+                let mut next = self.name_existing_form(client, existing.clone());
+                next.back = form.back;
+                return Mode::AccountForm(next);
             }
             form.installed = crate::transfer::have_program(accounts::agents().nth(form.agent).unwrap().command);
             form.scroll = 0;
@@ -505,6 +520,7 @@ impl Server {
                     Ok(pane) => {
                         if let Some(c) = self.clients.get_mut(&client) {
                             c.adding_account = Some(pane);
+                            c.adding_account_back = form.back;
                         }
                         return Mode::Normal;
                     }
@@ -565,13 +581,19 @@ impl Server {
             _ => false,
         };
         if actions {
-            let mut picker = self.accounts_picker(Some(&details.account));
+            let mut picker = self.accounts_picker(None);
+            if let Some(state) = details.back {
+                picker.restore(state);
+            } else {
+                picker.standalone_actions = true;
+            }
+            select_account(&mut picker, &details.account);
             if matches!(picker.current().map(|i| &i.action), Some(PickAction::AccountDetails(_))) {
                 picker.actions = Some(0);
             }
             Mode::Picker(picker)
         } else if back {
-            Mode::Picker(self.accounts_picker(Some(&details.account)))
+            self.form_back(client, details.back)
         } else {
             Mode::AccountDetails(details)
         }
@@ -581,16 +603,14 @@ impl Server {
         let clients: Vec<_> = self
             .clients
             .iter()
-            .filter_map(|(&id, c)| {
-                (c.adding_account == Some(pane)
-                    && matches!(c.mode, Mode::Normal)
-                    && self.client_focus(id) == Some(pane))
-                .then_some(id)
+            .filter(|&(id, c)| {
+                c.adding_account == Some(pane) && matches!(c.mode, Mode::Normal) && self.client_focus(*id) == Some(pane)
             })
+            .map(|(&id, c)| (id, c.adding_account_back.clone()))
             .collect();
         self.abandon_added_login(pane);
-        for id in clients {
-            self.account_added(id, account);
+        for (id, back) in clients {
+            self.account_added(id, account, back);
         }
     }
 
@@ -598,9 +618,20 @@ impl Server {
         for c in self.clients.values_mut() {
             if c.adding_account == Some(pane) {
                 c.adding_account = None;
+                c.adding_account_back = None;
             }
         }
     }
+}
+
+pub(super) fn select_account(picker: &mut Picker, account: &str) {
+    let matches = |i: &PickItem| matches!(&i.action, PickAction::AccountDetails(id) if id == account);
+    if !picker.filtered.iter().any(|&i| matches(&picker.items[i])) {
+        picker.query.clear();
+        picker.cursor = 0;
+        picker.refilter();
+    }
+    picker.select(matches);
 }
 
 /// Called under the accounts lock, after the sign-in check completes.
@@ -773,6 +804,223 @@ mod tests {
     fn server() -> Server {
         let (tx, _) = super::super::queue::channel(16);
         super::super::tests::server(tx)
+    }
+
+    fn click(area: Rect) -> InputEvent {
+        InputEvent::Mouse(MouseEvent {
+            kind: MouseKind::Press(MouseButton::Left),
+            col: area.x,
+            row: area.y,
+            mods: Default::default(),
+        })
+    }
+
+    #[test]
+    fn account_details_and_their_rename_action_keep_the_origin() {
+        let mut server = server();
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let account = server.accounts.add(account()).unwrap();
+        let mut list = server.accounts_picker(Some(&account.id));
+        list.query = "work".into();
+        list.cursor = 2;
+        list.refilter();
+        for from_list in [false, true] {
+            let from = from_list.then_some(&list);
+            for rename in [false, true] {
+                let Mode::AccountDetails(details) = server.account_details(&account.id, from) else { panic!() };
+                let mode = if rename {
+                    let Mode::Picker(mut picker) = server.on_account_details(client, details, key("tab")) else {
+                        panic!()
+                    };
+                    picker.actions =
+                        Some(picker.action_keys().iter().position(|(_, label)| *label == "Rename").unwrap());
+                    server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
+                    server.client_input(client, b"\r");
+                    assert!(matches!(server.clients[&client].mode, Mode::Prompt(_)));
+                    server.client_input(client, b"\x1b");
+                    server.flush_client_input(client);
+                    std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+                } else {
+                    server.on_account_details(client, details, key("esc"))
+                };
+                forms::assert_return(mode, from);
+            }
+        }
+    }
+
+    #[test]
+    fn account_details_actions_keep_the_account_after_a_concurrent_rename() {
+        for query in ["", "work", "claude"] {
+            let mut server = server();
+            let (client, _peer) = super::super::tests::client(&mut server);
+            let mut first = account();
+            first.name = "first".into();
+            first.home = "/nonexistent/first".into();
+            server.accounts.add(first).unwrap();
+            let account = server.accounts.add(account()).unwrap();
+            let mut list = server.accounts_picker(None);
+            list.query = query.into();
+            list.cursor = query.len();
+            list.refilter();
+            select_account(&mut list, &account.id);
+            let Mode::AccountDetails(details) = server.account_details(&account.id, Some(&list)) else { panic!() };
+            // Another client renames the account while these details are still open.
+            server.accounts.rename("claude", "work", "personal").unwrap();
+            let Mode::Picker(picker) = server.on_account_details(client, details, key("tab")) else { panic!() };
+            assert!(
+                matches!(picker.current().map(|i| &i.action), Some(PickAction::AccountDetails(id)) if *id == account.id)
+            );
+            assert_eq!(picker.current().unwrap().label, "Claude · personal");
+            assert_eq!(picker.query, if query == "work" { "" } else { query });
+            assert_eq!(picker.cursor, picker.query.len());
+            assert_eq!(picker.actions, Some(0));
+            assert_eq!(picker.action_keys(), &[("ctrl+r", "Rename"), ("ctrl+l", "Sign in"), ("ctrl+x", "Remove")]);
+        }
+    }
+
+    #[test]
+    fn renaming_a_filtered_account_keeps_the_renamed_account_selected() {
+        if !crate::testing::in_own_process(
+            "server::account_ui::tests::renaming_a_filtered_account_keeps_the_renamed_account_selected",
+        ) {
+            return;
+        }
+        let mut server = server();
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let account = server.update_accounts(|all| all.add(account())).unwrap();
+        server.accounts = Accounts::load().unwrap();
+        let mut list = server.accounts_picker(Some(&account.id));
+        list.query = "work".into();
+        list.cursor = 4;
+        list.refilter();
+        server.clients.get_mut(&client).unwrap().mode = Mode::Picker(list);
+        server.client_input(client, b"\x12");
+        assert!(matches!(server.clients[&client].mode, Mode::Prompt(_)));
+        server.client_input(client, b"\x15personal\r");
+        let Mode::Picker(picker) = &server.clients[&client].mode else { panic!("expected the Accounts list") };
+        assert_eq!(picker.query, "");
+        assert_eq!(picker.cursor, 0);
+        assert!(
+            matches!(picker.current().map(|i| &i.action), Some(PickAction::AccountDetails(id)) if *id == account.id)
+        );
+        assert_eq!(picker.current().unwrap().label, "Claude · personal");
+        assert_eq!(Accounts::load().unwrap().by_id(&account.id).unwrap().name, "personal");
+    }
+
+    #[test]
+    fn reviewing_an_existing_account_keeps_the_add_forms_origin() {
+        let mut server = server();
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut existing = account();
+        existing.review = true;
+        server.accounts.add(account()).unwrap();
+        for from_list in [false, true] {
+            let mut list = server.accounts_picker(None);
+            list.query = "search".into();
+            list.cursor = 2;
+            list.refilter();
+            let from = from_list.then_some(&list);
+            for step in 0..3 {
+                let mut form = server.account_form(client);
+                form.existing = Some(existing.clone());
+                form.choice = None;
+                form.field = 2;
+                form.back = from.and_then(Picker::form_back);
+                let Mode::Picker(picker) = server.on_account_form(client, form, key("enter")) else { panic!() };
+                let mode = if step > 0 {
+                    let item = picker
+                        .items
+                        .iter()
+                        .find(|i| matches!(&i.action, PickAction::UseExisting { target, .. } if target.is_some() == (step == 2)))
+                        .unwrap()
+                        .clone();
+                    let mode = server.pick(client, &picker, item);
+                    if step == 2 {
+                        assert!(matches!(mode, Mode::Confirm(_)));
+                        server.clients.get_mut(&client).unwrap().mode = mode;
+                        server.client_input(client, b"\r");
+                        std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+                    } else {
+                        mode
+                    }
+                } else {
+                    Mode::Picker(picker)
+                };
+                server.clients.get_mut(&client).unwrap().mode = mode;
+                server.client_input(client, b"\x1b");
+                server.flush_client_input(client);
+                let mode = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal);
+                forms::assert_return(mode, from);
+            }
+        }
+    }
+
+    #[test]
+    fn account_cancel_and_results_preserve_the_origin_even_during_checks() {
+        let mut server = server();
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let account = server.accounts.add(account()).unwrap();
+        for size in [(80, 24), (124, 36)] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            for origin in 0..3 {
+                let mut list = server.accounts_picker(Some(&account.id));
+                list.query = "work".into();
+                list.cursor = 2;
+                list.refilter();
+                list.standalone_actions = origin == 1;
+                let from = (origin != 2).then_some(&list);
+                for existing in [false, true] {
+                    for checking in [false, true] {
+                        for leave in 0..3 {
+                            if checking && leave == 2 {
+                                continue;
+                            }
+                            let mut form = if existing {
+                                server.name_existing_form(client, account.clone())
+                            } else {
+                                server.account_form(client)
+                            };
+                            form.back = from.and_then(Picker::form_back);
+                            form.checking = checking.then_some(42);
+                            let layout = form_layout(&form, server.client_screen(client));
+                            let event = match leave {
+                                0 => key("esc"),
+                                1 => click(layout.cancel),
+                                _ => {
+                                    form.field = form_buttons(&form).cancel.field;
+                                    key("enter")
+                                }
+                            };
+                            forms::assert_return(server.on_account_form(client, form, event), from);
+                        }
+                    }
+                }
+                for login in [false, true] {
+                    for leave in [b"\x1b".as_slice(), b"\x03", b"\x07"] {
+                        if login {
+                            let pane = server.alloc_id();
+                            server.workspaces[0].tab_mut().unwrap().focus = Some(pane);
+                            let c = server.clients.get_mut(&client).unwrap();
+                            c.mode = Mode::Normal;
+                            c.adding_account = Some(pane);
+                            c.adding_account_back = from.and_then(Picker::form_back);
+                            server.added_login_finished(pane, &account);
+                            assert!(server.clients[&client].adding_account_back.is_none());
+                        } else {
+                            server.account_added(client, &account, from.and_then(Picker::form_back));
+                        }
+                        assert!(
+                            matches!(&server.clients[&client].mode, Mode::Picker(p) if p.message.as_deref() == Some("Account added"))
+                        );
+                        server.client_input(client, leave);
+                        server.flush_client_input(client);
+                        let mode = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal);
+                        forms::assert_return(mode, from);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1358,9 +1606,7 @@ mod tests {
         let Mode::AccountForm(form) = server.on_account_form(0, form, key("right")) else { panic!() };
         assert_eq!(form.agent, 1);
         assert_eq!(form.name, name);
-        assert!(
-            matches!(server.on_account_form(0, form, key("esc")), Mode::Picker(p) if p.kind == PickerKind::Accounts)
-        );
+        assert!(matches!(server.on_account_form(0, form, key("esc")), Mode::Normal));
     }
 
     #[test]
@@ -1397,7 +1643,7 @@ mod tests {
         };
         let Mode::AccountForm(form) = server.on_account_form(0, form, click(l.primary)) else { panic!() };
         assert!(form.error.is_some(), "one click submitted the form");
-        assert!(matches!(server.on_account_form(0, form, click(l.cancel)), Mode::Picker(_)));
+        assert!(matches!(server.on_account_form(0, form, click(l.cancel)), Mode::Normal));
     }
 
     #[test]
@@ -1412,7 +1658,7 @@ mod tests {
         draw_form(&form, screen, &mut buf);
         let text = crate::testing::buffer_text(&buf);
         assert!(text.find("Use existing account").unwrap() < text.find("Sign in to another account").unwrap());
-        let Mode::AccountDetails(details) = server.account_details(&a.id) else { panic!() };
+        let Mode::AccountDetails(details) = server.account_details(&a.id, None) else { panic!() };
         assert_eq!(details.text, "No usage yet");
         assert!(matches!(server.on_account_details(0, details, key("tab")), Mode::Picker(p) if p.actions == Some(0)));
     }
@@ -1428,7 +1674,7 @@ mod tests {
         let text = crate::testing::buffer_text(&buf);
         assert!(text.contains("Checking sign-in..."));
         assert!(!text.contains("Enter Sign in"));
-        assert!(matches!(server.on_account_form(0, form, key("esc")), Mode::Picker(_)));
+        assert!(matches!(server.on_account_form(0, form, key("esc")), Mode::Normal));
     }
 }
 

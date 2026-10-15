@@ -125,8 +125,8 @@ impl Server {
         match ev {
             InputEvent::Key(k) => match (k.code, k.mods.ctrl) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => {
-                    return if p.kind == PickerKind::AccountReview {
-                        Mode::Picker(self.accounts_picker(None))
+                    return if p.close_to.is_some() || p.kind == PickerKind::AccountReview {
+                        self.form_back(id, p.close_to.take().map(|s| *s))
                     } else if p.kind == PickerKind::DeletedWorkspaces {
                         let mut back = self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace));
                         if let Some(state) = p.back.take() {
@@ -157,6 +157,11 @@ impl Server {
                 (KeyCode::Down, _) | (KeyCode::Char('n'), true) | (KeyCode::Char('j'), true) => p.move_by(1),
                 (KeyCode::PageUp, _) => p.move_by(-10),
                 (KeyCode::PageDown, _) => p.move_by(10),
+                (KeyCode::Char('e'), true) if p.kind == PickerKind::Pane => {
+                    if let Some(PickAction::FocusPane { pane, .. }) = p.current().map(|i| &i.action) {
+                        return self.edit_pane_form(id, *pane, Some(&p));
+                    }
+                }
                 (KeyCode::Char(key @ ('a' | 'u')), true) if p.kind == PickerKind::Pane => {
                     if let Some(PickAction::FocusPane { pane, .. }) = p.current().map(|i| &i.action) {
                         if key == 'a' {
@@ -197,7 +202,7 @@ impl Server {
                 (KeyCode::Char('d'), true) if p.kind == PickerKind::Agent => {
                     if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| &i.action) {
                         if let Some(a) = account.as_deref().and_then(|account| self.accounts.get(agent, account)) {
-                            return self.account_details(&a.id);
+                            return self.account_details(&a.id, None);
                         }
                         if let Some(agent) = crate::agent_registry::find(agent).filter(|a| a.accounts.is_none()) {
                             p.message = Some(agent.account_message());
@@ -219,11 +224,13 @@ impl Server {
                     {
                         match key {
                             'r' => {
-                                return Mode::Prompt(Prompt::new(
+                                let mut prompt = Prompt::new(
                                     &format!("Rename {}", super::super::account_ui::label(&a)),
                                     &a.name,
                                     PromptAction::RenameAccount { agent: a.agent.clone(), account: a.key() },
-                                ));
+                                );
+                                prompt.back = p.form_back();
+                                return Mode::Prompt(prompt);
                             }
                             'l' => {
                                 if let Err(e) = self.open_login(id, &a) {
@@ -265,7 +272,7 @@ impl Server {
                 }
                 (KeyCode::Char('r' | 'x'), true) if p.kind == PickerKind::Tunnels => {
                     if let Some(PickAction::Tunnel { id: tunnel, .. }) = p.current().map(|i| &i.action) {
-                        return self.tunnel_action(*tunnel, k.code == KeyCode::Char('r'), Some(p.state()));
+                        return self.tunnel_action(*tunnel, k.code == KeyCode::Char('r'), p.form_back());
                     }
                 }
                 (KeyCode::Char('o'), true) if p.kind == PickerKind::Ssh => {
@@ -385,7 +392,7 @@ impl Server {
                         return self.pick(id, &p, item);
                     }
                 } else if !layout.area.contains(ratatui::layout::Position::new(col, row)) {
-                    return Mode::Normal;
+                    return self.form_back(id, p.close_to.take().map(|s| *s));
                 }
             }
             _ => {}
@@ -438,7 +445,7 @@ impl Server {
                 return Mode::Prompt(self.add_workspace_form(id, Some(p)));
             }
             PickAction::AddTunnel => return Mode::Prompt(self.add_tunnel_form(Some(p), "")),
-            PickAction::Tunnel { id, .. } => return self.tunnel_details(id, Some(p.state())),
+            PickAction::Tunnel { id, .. } => return self.tunnel_details(id, p.form_back()),
             PickAction::AddServer(server) => {
                 return Mode::Prompt(self.add_server_form(Some(p), server.as_deref()));
             }
@@ -459,19 +466,25 @@ impl Server {
             PickAction::RunBlock(i) => return self.run_block(id, i),
             PickAction::RunbookList => return self.runbook_list(id),
             PickAction::Tool { pane, name } => return self.tool_request(id, pane, &name, None),
-            PickAction::ReviewAccount(existing) => return Mode::Picker(self.review_account_picker(&existing)),
+            PickAction::ReviewAccount(existing) => {
+                let mut picker = self.review_account_picker(&existing);
+                picker.close_to = p.form_back().map(Box::new);
+                return Mode::Picker(picker);
+            }
             PickAction::CheckExisting { agent } => {
                 self.retry_existing_account(&agent);
                 return Mode::Picker(self.accounts_picker(None));
             }
             PickAction::UseExisting { existing, target } => {
                 if target.is_none() {
-                    return Mode::AccountForm(self.name_existing_form(id, *existing));
+                    let mut form = self.name_existing_form(id, *existing);
+                    form.back = p.form_back();
+                    return Mode::AccountForm(form);
                 }
                 let name = target.as_ref().map_or(existing.name.as_str(), |a| &a.name);
                 return Mode::confirm(
                     format!("Use {name}?\nYour running agents will keep working.\nThis account will appear once."),
-                    ConfirmAction::UseExisting { existing, target },
+                    ConfirmAction::UseExisting { existing, target, back: p.form_back().map(Box::new) },
                 );
             }
             PickAction::AgentLaunch { agent, account } => {
@@ -506,8 +519,12 @@ impl Server {
                 }
             }
             PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
-            PickAction::AddAccount => return Mode::AccountForm(self.account_form(id)),
-            PickAction::AccountDetails(account) => return self.account_details(&account),
+            PickAction::AddAccount => {
+                let mut form = self.account_form(id);
+                form.back = p.form_back();
+                return Mode::AccountForm(form);
+            }
+            PickAction::AccountDetails(account) => return self.account_details(&account, Some(p)),
             PickAction::UnavailableDefinition(path) => {
                 return self.import_source_form(id, &path, p);
             }
@@ -682,7 +699,7 @@ impl Server {
             }
             "Duplicate" => {
                 return match p.current().and_then(|i| i.action.workspace()) {
-                    Some(ws) => self.duplicate_workspace_form(ws, &p),
+                    Some(ws) => self.duplicate_workspace_form(ws, Some(&p)),
                     None => Mode::Picker(p),
                 };
             }
@@ -726,7 +743,7 @@ impl Server {
         Picker::new(PickerKind::Commands, "Commands", items)
     }
 
-    pub(super) fn pane_picker(&self) -> Picker {
+    pub(in crate::server) fn pane_picker(&self) -> Picker {
         let mut items = Vec::new();
         for ws in &self.workspaces {
             for tab in &ws.tabs {
@@ -800,6 +817,60 @@ impl Server {
 #[cfg(test)]
 mod workspace_tests {
     use super::*;
+
+    #[test]
+    fn list_keys_direct_keys_and_palette_keep_the_form_origin() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for bytes in [b"\x02An".as_slice(), b"\x02Wn", b"\x02We", b"\x02Ws", b"\x02Sn"] {
+            server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
+            server.client_input(client, bytes);
+            assert!(matches!(server.clients[&client].mode, Mode::Prompt(_) | Mode::AccountForm(_)));
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+        }
+        for action in [Action::AddAccount, Action::NewWorkspace, Action::RenameWorkspace, Action::AddServer] {
+            let picker = server.command_picker();
+            let item = PickItem::new("", "", PickAction::Command(Command::Action(action)));
+            let mode = server.pick(client, &picker, item);
+            assert!(matches!(mode, Mode::Prompt(_) | Mode::AccountForm(_)));
+            server.clients.get_mut(&client).unwrap().mode = mode;
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+        }
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        let account = server.accounts.add(account).unwrap();
+        for sidebar in [false, true] {
+            for rename in [false, true] {
+                let mut list = server.accounts_picker(Some(&account.id));
+                list.query = "work".into();
+                list.cursor = 2;
+                list.refilter();
+                if !rename {
+                    list.select(|i| matches!(i.action, PickAction::AddAccount));
+                }
+                list.standalone_actions = sidebar;
+                let expected = list.state();
+                let spec = crate::input::KeySpec::parse(if rename { "ctrl+r" } else { "enter" }).unwrap();
+                let mode = server.on_picker(
+                    client,
+                    list,
+                    InputEvent::Key(Key { code: spec.code, mods: spec.mods, raw: Vec::new() }),
+                );
+                server.clients.get_mut(&client).unwrap().mode = mode;
+                server.client_input(client, b"\x1b");
+                server.flush_client_input(client);
+                let mode = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal);
+                let mut list = server.accounts_picker(None);
+                list.restore(expected);
+                crate::server::forms::assert_return(mode, Some(&list));
+            }
+        }
+    }
 
     #[test]
     fn attachment_commands_are_not_dimmed_without_shortcuts() {
