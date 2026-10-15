@@ -98,6 +98,8 @@ struct Permissions {
 
 #[derive(Serialize, Deserialize)]
 struct Permission {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    write: bool,
     name: String,
     ssh: Vec<String>,
 }
@@ -123,25 +125,30 @@ pub fn image_allowed(path: &Path, ssh: &[String]) -> bool {
 }
 
 pub fn remember_image(path: &Path, ssh: &[String], name: &str) -> Result<()> {
-    remember_permission(path, ssh, name, |p| &mut p.clipboard_image)
+    remember_permission(path, ssh, name, false, |p| &mut p.clipboard_image)
 }
 
 pub fn remember(path: &Path, ssh: &[String], name: &str) -> Result<()> {
-    remember_permission(path, ssh, name, |p| &mut p.server)
+    remember_permission(path, ssh, name, false, |p| &mut p.server)
 }
 
 pub fn laptop_allowed(path: &Path, ssh: &[String]) -> bool {
     permissions(path).is_ok_and(|p| p.laptop_copy.iter().any(|server| server.ssh == ssh))
 }
 
+pub fn laptop_write_allowed(path: &Path, ssh: &[String]) -> bool {
+    permissions(path).is_ok_and(|p| p.laptop_copy.iter().any(|server| server.ssh == ssh && server.write))
+}
+
 pub fn remember_laptop(path: &Path, ssh: &[String], name: &str) -> Result<()> {
-    remember_permission(path, ssh, name, |p| &mut p.laptop_copy)
+    remember_permission(path, ssh, name, true, |p| &mut p.laptop_copy)
 }
 
 fn remember_permission(
     path: &Path,
     ssh: &[String],
     name: &str,
+    write: bool,
     entries: impl FnOnce(&mut Permissions) -> &mut Vec<Permission>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -150,8 +157,10 @@ fn remember_permission(
     crate::paths::locked(path, || {
         let mut p = permissions(path)?;
         let entries = entries(&mut p);
-        if !entries.iter().any(|server| server.ssh == ssh) {
-            entries.push(Permission { name: name.into(), ssh: ssh.to_vec() });
+        if let Some(server) = entries.iter_mut().find(|server| server.ssh == ssh) {
+            server.write |= write;
+        } else {
+            entries.push(Permission { write, name: name.into(), ssh: ssh.to_vec() });
         }
         crate::paths::write_atomic(path, toml::to_string_pretty(&p)?.as_bytes())?;
         Ok(())
@@ -262,5 +271,20 @@ mod tests {
         assert!(remember(&path, &ssh, "box").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not valid toml");
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn laptop_read_grants_do_not_silently_expand_to_writes() {
+        let dir = crate::testing::TempDir::new("laptop-grant-upgrade");
+        let path = dir.0.join("laptop-files.toml");
+        let ssh = vec!["me@anvil".into()];
+        std::fs::write(&path, "[[laptop_copy]]\nname = 'anvil'\nssh = ['me@anvil']\n").unwrap();
+        assert!(laptop_allowed(&path, &ssh));
+        assert!(!laptop_write_allowed(&path, &ssh));
+        remember_laptop(&path, &ssh, "anvil").unwrap();
+        assert!(laptop_allowed(&path, &ssh) && laptop_write_allowed(&path, &ssh));
+        assert_eq!(permissions(&path).unwrap().laptop_copy.len(), 1);
+        assert!(!laptop_write_allowed(&path, &["other".into()]));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!laptop_write_allowed(&path, &ssh));
     }
 }

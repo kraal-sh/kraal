@@ -1,10 +1,10 @@
-//! The laptop reader and the receiving job. The session server only relays their messages.
+//! File streams between the laptop and its copy job. The session server only relays their messages.
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -26,6 +26,7 @@ pub const TOKEN_ENV: &str = "KRAAL_LAPTOP_COPY_TOKEN";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
+    pub to_laptop: bool,
     pub sources: Vec<String>,
     pub destination: PathBuf,
     pub allow: Vec<String>,
@@ -44,6 +45,8 @@ pub enum FromClient {
 pub enum ToClient {
     Ready(Spec),
     Start { sources: Vec<String> },
+    Write(Spec),
+    Progress,
     Data { sequence: u64, packet: Packet },
     Ack(u64),
     Finish(Result<(), String>),
@@ -114,7 +117,7 @@ fn open_file(path: &Path) -> Result<File> {
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
-    ensure!(fd >= 0, "cannot open laptop file: {}", std::io::Error::last_os_error());
+    ensure!(fd >= 0, "cannot open source file: {}", std::io::Error::last_os_error());
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -147,7 +150,7 @@ fn manifest(
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let ok =
             unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
-        ensure!(ok == 0, "cannot inspect laptop item: {}", std::io::Error::last_os_error());
+        ensure!(ok == 0, "cannot inspect source item: {}", std::io::Error::last_os_error());
         let stat = unsafe { stat.assume_init() };
         let kind = stat.st_mode & libc::S_IFMT;
         if ![libc::S_IFREG, libc::S_IFDIR, libc::S_IFLNK].contains(&kind) {
@@ -157,7 +160,10 @@ fn manifest(
             let mut bytes = vec![0u8; 16 * 1024 + 1];
             let len =
                 unsafe { libc::readlinkat(parent.as_raw_fd(), name.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len()) };
-            ensure!(len >= 0 && (len as usize) < bytes.len(), "cannot read symbolic link: copy it on the laptop");
+            ensure!(
+                len >= 0 && (len as usize) < bytes.len(),
+                "cannot read symbolic link: copy it on the source machine"
+            );
             bytes.truncate(len as usize);
             let target = String::from_utf8(bytes).context("symbolic link is not UTF-8")?;
             let resolved = path
@@ -165,7 +171,7 @@ fn manifest(
                 .unwrap()
                 .join(&target)
                 .canonicalize()
-                .context("cannot resolve symbolic link inside the laptop scope")?;
+                .context("cannot resolve symbolic link inside the source scope")?;
             super::scoped_path(resolved.to_str().context("link target is not UTF-8")?, home, scope, macos)?;
             (Kind::Link(target), None)
         } else {
@@ -175,18 +181,18 @@ fn manifest(
             // macOS uses a signed 32-bit device id; MetadataExt exposes it as u64.
             #[allow(clippy::unnecessary_cast)]
             let device = stat.st_dev as u64;
-            ensure!(metadata.dev() == device && metadata.ino() == stat.st_ino, "laptop item changed: retry the copy");
+            ensure!(metadata.dev() == device && metadata.ino() == stat.st_ino, "source item changed: retry the copy");
             if metadata.is_dir() {
                 let (_, entries) =
                     super::list_directory(path.to_str().context("path is not UTF-8")?, home, scope, macos, true)?;
                 ensure!(pending.len() + sources.len() + entries.len() <= ENTRIES, "too many entries: copy fewer items");
                 for entry in entries.into_iter().rev() {
-                    ensure!(entry.exact, "a file name is not UTF-8: copy it on the laptop");
+                    ensure!(entry.exact, "a file name is not UTF-8: copy it on the source machine");
                     pending.push((path.join(&entry.name), format!("{relative}/{}", entry.name)));
                 }
                 (Kind::Directory, Some(metadata))
             } else {
-                ensure!(metadata.is_file(), "laptop item changed: retry the copy");
+                ensure!(metadata.is_file(), "source item changed: retry the copy");
                 (Kind::File, Some(metadata))
             }
         };
@@ -208,7 +214,7 @@ fn manifest(
     Ok(sources)
 }
 
-/// Four bounded packets at most, each acknowledged in order by the spool writer.
+/// Four bounded packets at most, each acknowledged in order by the receiver.
 pub struct Window {
     next: u64,
     pending: VecDeque<u64>,
@@ -253,7 +259,7 @@ pub fn send(
         check()?;
         let mut file = if matches!(source.entry.kind, Kind::File) {
             let file = open_file(&source.path)?;
-            ensure!(same(source.metadata.as_ref().unwrap(), &file.metadata()?), "laptop file changed: retry the copy");
+            ensure!(same(source.metadata.as_ref().unwrap(), &file.metadata()?), "source file changed: retry the copy");
             Some(file)
         } else {
             None
@@ -264,13 +270,13 @@ pub fn send(
             while left != 0 {
                 check()?;
                 let n = left.min(CHUNK as u64) as usize;
-                file.read_exact(&mut bytes[..n]).context("laptop file changed while copying: retry the copy")?;
+                file.read_exact(&mut bytes[..n]).context("source file changed while copying: retry the copy")?;
                 emit(Packet::Chunk(STANDARD.encode(&bytes[..n])))?;
                 left -= n as u64;
             }
             ensure!(
                 same(source.metadata.as_ref().unwrap(), &file.metadata()?),
-                "laptop file changed while copying: retry the copy"
+                "source file changed while copying: retry the copy"
             );
         }
         emit(Packet::End)?;
@@ -278,10 +284,27 @@ pub fn send(
     emit(Packet::Done)
 }
 
-fn free_space(path: &Path) -> Result<u64> {
-    let path = CString::new(path.as_os_str().as_bytes())?;
+fn session_sources(paths: &[String]) -> Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| {
+            let path = Path::new(path);
+            // Session directories can have linked ancestors (including /tmp on macOS).
+            // Keep the selected entry itself, and the later no-follow checks, unchanged.
+            let parent = path
+                .parent()
+                .context("missing source directory")?
+                .canonicalize()
+                .context("cannot resolve source directory")?;
+            let path = parent.join(path.file_name().context("missing source name")?);
+            Ok(path.to_str().context("source path is not UTF-8")?.to_owned())
+        })
+        .collect()
+}
+
+fn free_space(fd: &OwnedFd) -> Result<u64> {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    let ok = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    let ok = unsafe { libc::fstatvfs(fd.as_raw_fd(), stat.as_mut_ptr()) };
     ensure!(ok == 0, "cannot check free space: {}", std::io::Error::last_os_error());
     let stat = unsafe { stat.assume_init() };
     // macOS statvfs counts available blocks in u32; Linux uses u64.
@@ -299,7 +322,7 @@ fn enough_space(total: u64, available: u64, place: &Path) -> Result<()> {
     Ok(())
 }
 
-fn relative(path: &str) -> Result<&Path> {
+pub(super) fn relative(path: &str) -> Result<&Path> {
     let path = Path::new(path);
     ensure!(
         !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_))),
@@ -308,6 +331,7 @@ fn relative(path: &str) -> Result<&Path> {
     Ok(path)
 }
 
+#[cfg(test)]
 fn metadata(path: &Path, entry: &Entry) -> Result<()> {
     ensure!((0..1_000_000_000).contains(&entry.nanos), "invalid file timestamp");
     let path = CString::new(path.as_os_str().as_bytes())?;
@@ -328,6 +352,8 @@ fn metadata(path: &Path, entry: &Entry) -> Result<()> {
 
 pub struct Receiver {
     root: PathBuf,
+    fd: OwnedFd,
+    destination_fd: OwnedFd,
     destination: PathBuf,
     tops: HashSet<String>,
     seen: HashSet<String>,
@@ -337,10 +363,20 @@ pub struct Receiver {
     written: u64,
     current: Option<(Entry, Option<File>, u64)>,
     done: bool,
+    pub(super) quiet: bool,
 }
 
 impl Receiver {
     pub fn new(root: PathBuf, spec: &Spec) -> Result<Self> {
+        // The session spool is trusted, including symlinked state-directory ancestors.
+        // Writes beneath it still use the receiver's descriptor-relative component walk.
+        let root = root.canonicalize().context("cannot resolve the session spool")?;
+        let fd = super::open_directory(&root)?;
+        let destination = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(&spec.destination)?;
+        Self::at(root, fd, destination.into(), spec)
+    }
+
+    pub(super) fn at(root: PathBuf, fd: OwnedFd, destination_fd: OwnedFd, spec: &Spec) -> Result<Self> {
         let tops = spec
             .sources
             .iter()
@@ -350,6 +386,8 @@ impl Receiver {
             .collect::<Result<HashSet<_>>>()?;
         ensure!(tops.len() == spec.sources.len(), "duplicate source names");
         Ok(Self {
+            fd,
+            destination_fd,
             root,
             destination: spec.destination.clone(),
             tops,
@@ -360,6 +398,7 @@ impl Receiver {
             written: 0,
             current: None,
             done: false,
+            quiet: false,
         })
     }
 
@@ -368,9 +407,11 @@ impl Receiver {
         match packet {
             Packet::Begin { bytes, entries } => {
                 ensure!(self.announced.is_none() && entries > 0, "invalid laptop copy total");
-                enough_space(bytes, free_space(&self.root)?, &self.root)?;
-                enough_space(bytes, free_space(&self.destination)?, &self.destination)?;
-                eprintln!("Copying {entries} entries ({bytes} bytes). Close this window to cancel.");
+                enough_space(bytes, free_space(&self.fd)?, &self.root)?;
+                enough_space(bytes, free_space(&self.destination_fd)?, &self.destination)?;
+                if !self.quiet {
+                    eprintln!("Copying {entries} entries ({bytes} bytes). Close this window to cancel.");
+                }
                 self.announced = Some((bytes, entries));
             }
             Packet::Entry(entry) => {
@@ -383,28 +424,13 @@ impl Receiver {
                     "unexpected laptop copy path"
                 );
                 ensure!(self.seen.insert(entry.path.clone()), "duplicate laptop copy entry");
-                let target = self.root.join(path);
-                let file = match &entry.kind {
-                    Kind::File => Some(
-                        OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o600)
-                            .custom_flags(libc::O_NOFOLLOW)
-                            .open(&target)?,
-                    ),
-                    Kind::Directory => {
-                        ensure!(entry.size == 0, "invalid directory size");
-                        fs::create_dir(&target)?;
-                        self.directories.insert(path.to_path_buf());
-                        None
-                    }
-                    Kind::Link(to) => {
-                        ensure!(entry.size == 0, "invalid symbolic link size");
-                        std::os::unix::fs::symlink(to, &target)?;
-                        None
-                    }
-                };
+                if !matches!(entry.kind, Kind::File) {
+                    ensure!(entry.size == 0, "invalid directory or symbolic link size");
+                }
+                let file = super::stage::create_entry(&self.fd, &entry)?;
+                if matches!(entry.kind, Kind::Directory) {
+                    self.directories.insert(path.to_path_buf());
+                }
                 self.current = Some((entry, file, 0));
             }
             Packet::Chunk(data) => {
@@ -418,18 +444,20 @@ impl Receiver {
                 file.write_all(&bytes)?;
                 *written += bytes.len() as u64;
                 self.written += bytes.len() as u64;
-                eprint!("\rReceived {} / {total} bytes", self.written);
+                if !self.quiet {
+                    eprint!("\rReceived {} / {total} bytes", self.written);
+                }
             }
             Packet::End => {
                 let (entry, file, written) = self.current.take().context("end without an entry")?;
                 ensure!(written == entry.size, "laptop file ended early");
-                if let Some(file) = file {
+                if let Some(file) = &file {
                     file.sync_all()?;
                 }
                 if matches!(entry.kind, Kind::Directory) {
                     self.restore.push(entry);
                 } else {
-                    metadata(&self.root.join(&entry.path), &entry)?;
+                    super::stage::metadata(&self.fd, &entry, file.as_ref())?;
                 }
             }
             Packet::Done => {
@@ -442,10 +470,12 @@ impl Receiver {
                     "incomplete laptop copy"
                 );
                 for entry in self.restore.iter().rev() {
-                    metadata(&self.root.join(&entry.path), entry)?;
+                    super::stage::metadata(&self.fd, entry, None)?;
                 }
                 self.done = true;
-                eprintln!("\nReceived {bytes} bytes. Installing the copy.");
+                if !self.quiet {
+                    eprintln!("\nReceived {bytes} bytes. Installing the copy.");
+                }
             }
         }
         Ok(self.done)
@@ -605,6 +635,66 @@ impl Connection {
         }
     }
 
+    fn send_files(&mut self, spec: &Spec) -> Result<()> {
+        let result = (|| -> Result<()> {
+            ensure!(matches!(self.receive()?, ToClient::Ack(0)), "laptop destination was not prepared");
+            let sources = session_sources(&spec.sources)?;
+            let mut window = Window::new();
+            let mut sent = 0;
+            let cancelled = self.cancelled.clone();
+            send(
+                &sources,
+                Path::new("/"),
+                Scope::All,
+                |packet| {
+                    if window.full() {
+                        match self.receive()? {
+                            ToClient::Ack(sequence) => window.acknowledge(sequence)?,
+                            _ => bail!("invalid laptop copy acknowledgement"),
+                        }
+                    }
+                    let wait = matches!(packet, Packet::Begin { .. } | Packet::Done);
+                    if let Packet::Begin { bytes, entries } = &packet {
+                        eprintln!("Copying {entries} entries ({bytes} bytes). Close this window to cancel.");
+                    }
+                    if let Packet::Chunk(data) = &packet {
+                        sent += data.len() / 4 * 3 - data.bytes().rev().take_while(|b| *b == b'=').count();
+                        eprint!("\rSent {sent} bytes");
+                    }
+                    let sequence = window.sent()?;
+                    self.send(FromClient::Data { sequence, packet })?;
+                    if wait {
+                        while !window.empty() {
+                            match self.receive()? {
+                                ToClient::Ack(sequence) => window.acknowledge(sequence)?,
+                                _ => bail!("invalid laptop copy acknowledgement"),
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                || {
+                    ensure!(!cancelled.load(std::sync::atomic::Ordering::Acquire), "Laptop copy cancelled");
+                    Ok(())
+                },
+            )?;
+            loop {
+                match self.receive()? {
+                    ToClient::Finish(Ok(())) => break,
+                    ToClient::Progress => {}
+                    _ => bail!("copy completion was not acknowledged"),
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            let _ = self.send(FromClient::Finish(Err(format!("{error:#}"))));
+        }
+        result?;
+        eprintln!("Laptop copy complete.");
+        Ok(())
+    }
+
     fn install(&mut self, command: &mut std::process::Command) -> Result<()> {
         self.install_with_timeout(command, TIMEOUT)
     }
@@ -677,6 +767,9 @@ pub fn run(socket: &Path, session: &str) -> Result<()> {
         ToClient::Ready(spec) => spec,
         _ => bail!("laptop copy was not authorized"),
     };
+    if spec.to_laptop {
+        return connection.send_files(&spec);
+    }
     let result = (|| -> Result<()> {
         let root = spool_root(session);
         crate::paths::ensure_private_dir(&crate::paths::state_dir().join("laptop-v1"))?;
@@ -727,6 +820,7 @@ mod tests {
 
     fn spec(home: &TempDir, destination: &TempDir, name: &str) -> Spec {
         Spec {
+            to_laptop: false,
             sources: vec![home.0.join(name).to_str().unwrap().into()],
             destination: destination.0.clone(),
             allow: vec![],
@@ -804,7 +898,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o400)).unwrap();
         let result = send(&["~/folder".into()], &home.0, Scope::Home, |_| panic!("nothing may be sent"), || Ok(()));
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.unwrap_err().to_string().contains("cannot inspect laptop item"));
+        assert!(result.unwrap_err().to_string().contains("cannot inspect source item"));
     }
 
     fn install_without_rsync(spec: &Spec, spool: &Path) -> Result<()> {
@@ -1056,6 +1150,7 @@ mod tests {
     #[test]
     fn install_reuses_move_no_replace_and_only_approved_names_as_literal_arguments() {
         let spec = Spec {
+            to_laptop: false,
             sources: vec!["~/dir/-file with 'quotes'".into()],
             destination: "/dest space".into(),
             allow: vec!["-file with 'quotes'".into()],
@@ -1160,5 +1255,95 @@ mod tests {
         let before = Instant::now();
         assert!(connection.install(&mut command).is_err());
         assert!(before.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn session_sender_resolves_parent_links_but_preserves_selected_links() {
+        let source = TempDir::new("copy-send-linked");
+        source.mkdir("directory");
+        source.write("directory/report", "abc");
+        symlink("report", source.0.join("directory/link")).unwrap();
+        symlink(source.0.join("directory"), source.0.join("alias")).unwrap();
+        let paths = ["alias/report", "alias/link"].map(|name| source.0.join(name).to_str().unwrap().into());
+        let mut packets = Vec::new();
+        send(
+            &session_sources(&paths).unwrap(),
+            Path::new("/"),
+            Scope::All,
+            |packet| {
+                packets.push(packet);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(packets[0], Packet::Begin { bytes: 3, entries: 2 }));
+        assert!(packets.iter().any(|p| matches!(p, Packet::Chunk(data) if STANDARD.decode(data).unwrap() == b"abc")));
+        assert!(packets.iter().any(|p| {
+            matches!(p, Packet::Entry(Entry { path, kind: Kind::Link(to), .. }) if path == "link" && to == "report")
+        }));
+    }
+
+    #[test]
+    fn receiving_into_the_session_keeps_support_for_linked_destinations() {
+        let source = TempDir::new("copy-linked-source");
+        let spool = TempDir::new("copy-linked-spool");
+        let destination = TempDir::new("copy-linked-destination");
+        source.write("report", "abc");
+        symlink(&destination.0, source.0.join("destination")).unwrap();
+        let mut spec = spec(&source, &destination, "report");
+        spec.destination = source.0.join("destination");
+        let mut receiver = Receiver::new(spool.0.clone(), &spec).unwrap();
+        send(&spec.sources, &source.0, Scope::Home, |packet| receiver.receive(packet).map(|_| ()), || Ok(())).unwrap();
+        assert_eq!(fs::read(spool.0.join("report")).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_destination_replaced_by_a_fifo_is_refused_without_waiting_for_a_writer() {
+        let source = TempDir::new("copy-fifo-source");
+        let spool = TempDir::new("copy-fifo-spool");
+        let destination = TempDir::new("copy-fifo-destination");
+        let spec = spec(&source, &destination, "report");
+        fs::remove_dir(&destination.0).unwrap();
+        let path = CString::new(destination.0.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let root = spool.0.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(Receiver::new(root, &spec).map(|_| ())).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        // Unblock a regressed blocking open before failing, so the test leaves no worker behind.
+        let _writer = OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(&destination.0);
+        worker.join().unwrap();
+        let error = result.expect("opening a FIFO must not wait for a writer").unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(libc::ENOTDIR));
+        fs::remove_file(&destination.0).unwrap();
+    }
+
+    #[test]
+    fn receiving_into_the_session_accepts_a_symlinked_xdg_state_home() {
+        if !crate::testing::in_own_process(
+            "laptop::copy::tests::receiving_into_the_session_accepts_a_symlinked_xdg_state_home",
+        ) {
+            return;
+        }
+        let source = TempDir::new("copy-state-source");
+        let destination = TempDir::new("copy-state-destination");
+        let state = TempDir::new("copy-state-disk");
+        let link = source.0.join("state");
+        symlink(&state.0, &link).unwrap();
+        // This test runs alone in its own process; no other test reads this environment.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &link) };
+        let spool = spool_root("test").join("abc/payload");
+        fs::create_dir_all(&spool).unwrap();
+        source.mkdir("tree");
+        source.write("tree/report", "abc");
+        let spec = spec(&source, &destination, "tree");
+        let mut receiver = Receiver::new(spool.clone(), &spec).unwrap();
+        send(&spec.sources, &source.0, Scope::Home, |packet| receiver.receive(packet).map(|_| ()), || Ok(())).unwrap();
+        assert_eq!(fs::read(spool.join("tree/report")).unwrap(), b"abc");
+        assert!(spool.starts_with(&link));
+        assert!(receiver.root.starts_with(&state.0));
     }
 }

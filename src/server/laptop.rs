@@ -20,10 +20,37 @@ pub(super) struct Copy {
     progress: Instant,
     done: Option<u64>,
     installing: bool,
+    prepared: bool,
+}
+
+impl Copy {
+    fn sender(&self) -> Option<ClientId> {
+        if self.spec.to_laptop { self.job } else { Some(self.owner) }
+    }
+    fn receiver(&self) -> Option<ClientId> {
+        if self.spec.to_laptop { Some(self.owner) } else { self.job }
+    }
 }
 
 impl Server {
     pub(super) fn laptop_files_action(&mut self, client: ClientId, action: FilesAction) -> Mode {
+        if let FilesAction::Copy { sources, dest: Location::Laptop { owner_id, path, .. }, .. } = &action {
+            let paths: Option<Vec<_>> = sources
+                .iter()
+                .map(|s| match s {
+                    Location::Local(path) if path.is_absolute() => path.to_str().map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            if let Some(sources) = paths.filter(|paths| !paths.is_empty()) {
+                self.start_laptop_copy(
+                    client,
+                    owner_id,
+                    Spec { to_laptop: true, sources, destination: path.into(), allow: Vec::new() },
+                );
+                return Mode::Normal;
+            }
+        }
         if let FilesAction::Copy { sources, dest: Location::Local(destination), replaces } = action {
             if destination.to_str().is_none() || !destination.is_absolute() {
                 self.toast(
@@ -43,7 +70,7 @@ impl Server {
                 })
                 .collect();
             if let Some(sources) = paths.filter(|p| !p.is_empty()) {
-                let spec = Spec { sources, destination, allow: replaces };
+                let spec = Spec { to_laptop: false, sources, destination, allow: replaces };
                 if spec.allow.is_empty() {
                     self.start_laptop_copy(client, &owner, spec);
                 } else {
@@ -58,7 +85,7 @@ impl Server {
                 return Mode::Normal;
             }
         }
-        self.toast(client, NoticeKind::Error, "This laptop operation is unavailable: copy from your laptop to the session's machine, or run kraal cp on the laptop");
+        self.toast(client, NoticeKind::Error, "This laptop operation is unavailable: copy between your laptop and the session's machine, or run kraal cp on the laptop");
         Mode::Normal
     }
 
@@ -90,6 +117,7 @@ impl Server {
                     progress: Instant::now(),
                     done: None,
                     installing: false,
+                    prepared: false,
                 },
             );
         }
@@ -104,6 +132,14 @@ impl Server {
             self.copy_send(copy.owner, token, ToClient::Finish(result.clone()));
             if let Some(job) = copy.job {
                 self.copy_send(job, token, ToClient::Finish(result));
+            }
+            if copy.spec.to_laptop && copy.prepared {
+                for pane in self.panes.values_mut() {
+                    if let crate::pane::Content::Files(files) = &mut pane.content {
+                        files.refresh_laptop(copy.owner, &copy.spec.destination.to_string_lossy());
+                    }
+                }
+                self.mark_dirty();
             }
         }
     }
@@ -140,34 +176,55 @@ impl Server {
                 let owner = copy.owner;
                 let spec = copy.spec.clone();
                 self.copy_send(client, &token, ToClient::Ready(spec.clone()));
-                self.copy_send(owner, &token, ToClient::Start { sources: spec.sources });
+                self.copy_send(
+                    owner,
+                    &token,
+                    if spec.to_laptop { ToClient::Write(spec) } else { ToClient::Start { sources: spec.sources } },
+                );
             }
-            FromClient::Data { sequence, packet } if client == copy.owner && copy.job.is_some() => {
-                if copy.done.is_some() || !packet.bounded() || copy.window.sent().ok() != Some(sequence) {
+            FromClient::Data { sequence, packet } if Some(client) == copy.sender() && copy.job.is_some() => {
+                if (copy.spec.to_laptop && !copy.prepared)
+                    || copy.done.is_some()
+                    || !packet.bounded()
+                    || copy.window.sent().ok() != Some(sequence)
+                {
                     self.copy_finish(&token, Err("Invalid laptop copy data: retry the copy".into()));
                     return;
                 }
                 if matches!(packet, Packet::Done) {
                     copy.done = Some(sequence);
                 }
-                let job = copy.job.unwrap();
-                self.copy_send(job, &token, ToClient::Data { sequence, packet });
+                let receiver = copy.receiver().unwrap();
+                self.copy_send(receiver, &token, ToClient::Data { sequence, packet });
             }
-            FromClient::Ack(sequence) if Some(client) == copy.job => {
+            FromClient::Ack(sequence) if Some(client) == copy.receiver() && copy.job.is_some() => {
+                if copy.spec.to_laptop && !copy.prepared {
+                    if sequence == 0 {
+                        copy.prepared = true;
+                        copy.progress = Instant::now();
+                        let job = copy.job.unwrap();
+                        self.copy_send(job, &token, ToClient::Ack(0));
+                    }
+                    return;
+                }
                 if copy.window.acknowledge(sequence).is_err() {
                     self.copy_finish(&token, Err("Invalid laptop copy acknowledgement: retry the copy".into()));
                     return;
                 }
                 copy.progress = Instant::now();
                 copy.installing = copy.done == Some(sequence);
-                let owner = copy.owner;
-                self.copy_send(owner, &token, ToClient::Ack(sequence));
+                let sender = copy.sender().unwrap();
+                self.copy_send(sender, &token, ToClient::Ack(sequence));
             }
-            FromClient::Progress if Some(client) == copy.job && copy.installing => {
+            FromClient::Progress if Some(client) == copy.receiver() && copy.installing => {
                 copy.progress = Instant::now();
+                if copy.spec.to_laptop {
+                    let job = copy.job.unwrap();
+                    self.copy_send(job, &token, ToClient::Progress);
+                }
             }
             FromClient::Finish(result) if Some(client) == copy.job || client == copy.owner => {
-                if result.is_ok() && (Some(client) != copy.job || !copy.installing) {
+                if result.is_ok() && (Some(client) != copy.receiver() || !copy.installing) {
                     return;
                 }
                 self.copy_finish(&token, result);
@@ -223,6 +280,7 @@ mod tests {
                 pane: 99,
                 job: None,
                 spec: Spec {
+                    to_laptop: false,
                     sources: vec!["~/report".into()],
                     destination: "/destination".into(),
                     allow: vec!["report".into()],
@@ -231,6 +289,7 @@ mod tests {
                 progress: Instant::now(),
                 done: None,
                 installing: false,
+                prepared: false,
             },
         );
     }
@@ -439,5 +498,39 @@ mod tests {
         let mode = server.laptop_files_action(owner, action("abc"));
         assert!(matches!(mode, Mode::Confirm(_)));
         assert!(server.laptop_copies.is_empty(), "a replacement must be confirmed before minting a token");
+    }
+    #[test]
+    fn reverse_copy_routes_only_job_data_and_client_acknowledgements_and_completion() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (owner, _a) = client(&mut server);
+        let (job, _b) = client(&mut server);
+        let owner_out = server.clients.get_mut(&owner).unwrap().out.capture();
+        let job_out = server.clients.get_mut(&job).unwrap().out.capture();
+        grant(&mut server, owner, "abc");
+        server.laptop_copies.get_mut("abc").unwrap().spec.to_laptop = true;
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Ack(0));
+        assert!(!server.laptop_copies["abc"].prepared);
+        open(&mut server, job, "abc");
+        assert!(matches!(take(&job_out).1, ToClient::Ready(Spec { to_laptop: true, .. })));
+        assert!(matches!(take(&owner_out).1, ToClient::Write(_)));
+        server.laptop_copy_message(job, "abc".into(), FromClient::Ack(0));
+        assert!(job_out.try_recv().is_err());
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Ack(0));
+        assert!(matches!(take(&job_out).1, ToClient::Ack(0)));
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Data { sequence: 0, packet: Packet::Done });
+        assert!(job_out.try_recv().is_err() && owner_out.try_recv().is_err());
+        server.laptop_copy_message(job, "abc".into(), FromClient::Data { sequence: 0, packet: Packet::Done });
+        assert!(matches!(take(&owner_out).1, ToClient::Data { sequence: 0, packet: Packet::Done }));
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Ack(0));
+        assert!(matches!(take(&job_out).1, ToClient::Ack(0)));
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Progress);
+        assert!(matches!(take(&job_out).1, ToClient::Progress));
+        server.laptop_copy_message(job, "abc".into(), FromClient::Finish(Ok(())));
+        assert!(server.laptop_copies.contains_key("abc"));
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Finish(Ok(())));
+        assert!(matches!(take(&job_out).1, ToClient::Finish(Ok(()))));
+        assert!(matches!(take(&owner_out).1, ToClient::Finish(Ok(()))));
+        assert!(server.laptop_copies.is_empty());
     }
 }

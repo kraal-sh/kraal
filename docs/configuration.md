@@ -164,7 +164,9 @@ Larger or recursive transfers use `kraal cp`. See
 
 This setting belongs to the laptop running `attach --host`. It is read again for each file
 manager listing or copy request. The local client asks for permission before listing or
-reading anything. Permission to copy sends files from the laptop to the session machine.
+reading or writing anything. Permission to copy works between the laptop and the session
+machine in both directions. Replacing an item on the laptop always asks in the local client
+box, even with Always.
 
 ```toml config
 [laptop_files]
@@ -174,16 +176,17 @@ scope = "home"
 `laptop_files.scope` accepts `"home"` (the default), `"all"` or `"off"`. Home excludes hidden
 entries directly inside your home, and `~/Library` on macOS, even when hidden files are shown.
 Hidden files in deeper directories follow the file manager's `.` key. All allows directories
-anywhere your user can read; off refuses every request, including remembered permissions.
+anywhere your user can access; off refuses every request, including remembered permissions.
 Neither enabled scope follows symbolic links when opening directories or files. Copies preserve
 links whose targets resolve inside the scope and refuse links that escape it. An unreadable
 or invalid config refuses both listing and copying. A selected folder is copied recursively,
 including its nested hidden files.
 
-**Allow** lasts for the current attach, including reconnects. **Always** stores a `[[server]]`
-entry with `name` and `ssh` in `~/.config/kraal/laptop-files.toml` (or under
+**Allow** lasts for the current attach, including reconnects. **Always** stores a `[[laptop_copy]]`
+entry with `name`, `ssh` and `write = true` in `~/.config/kraal/laptop-files.toml` (or under
 `$XDG_CONFIG_HOME/kraal`). Removing the matching entry revokes Always at the next request;
-remove the file to revoke all remembered servers. This is separate from `paste-files.toml`.
+remove the file to revoke all remembered servers. Older grants without `write = true`
+permit reading and ask again before the first write. This is separate from `paste-files.toml`.
 See the [file manager](servers.md#the-file-manager) and [example](../examples/config/laptop-files.toml).
 
 ## Paste buffers

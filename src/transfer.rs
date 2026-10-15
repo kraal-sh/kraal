@@ -832,7 +832,7 @@ fn stage_prefix(sources: &[Endpoint], dest: &Endpoint) -> String {
 
 /// This process as a staging directory records who made it: machine, boot, process id, start
 /// time. `None` when the system cannot say: such a staging directory is never judged abandoned.
-fn owner_token() -> Option<String> {
+pub(crate) fn owner_token() -> Option<String> {
     let machine = crate::process::machine_id()?;
     let start = crate::process::start_time(std::process::id())?;
     Some(format!("{machine} {} {} {start}", word_or_dash(&crate::process::boot_id()), std::process::id()))

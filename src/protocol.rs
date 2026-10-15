@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Both released migration sources used protocol 2 and omitted it from Pong.
@@ -178,6 +178,12 @@ pub enum ClientMsg {
         request: u64,
         data: Vec<u8>,
         done: bool,
+    },
+    LaptopCaseSensitive {
+        pane: crate::layout::PaneId,
+        side: crate::files::Side,
+        request: u64,
+        case_sensitive: bool,
     },
     LaptopListed {
         pane: crate::layout::PaneId,
@@ -1107,6 +1113,12 @@ mod tests {
         ]);
         use crate::laptop::copy::{Entry, FromClient, Kind, Packet, Spec, ToClient};
         client.extend([
+            ClientMsg::LaptopCaseSensitive {
+                pane: 3,
+                side: crate::files::Side::Right,
+                request: 7,
+                case_sensitive: false,
+            },
             ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Open { version: PROTOCOL_VERSION } },
             ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Ack(3) },
             ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Finish(Ok(())) },
@@ -1116,12 +1128,23 @@ mod tests {
             ServerMsg::LaptopCopy {
                 token: s("abc"),
                 message: ToClient::Ready(Spec {
+                    to_laptop: false,
                     sources: vec![s("~/report")],
                     destination: p("/destination"),
                     allow: vec![s("report")],
                 }),
             },
             ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Start { sources: vec![s("~/report")] } },
+            ServerMsg::LaptopCopy {
+                token: s("abc"),
+                message: ToClient::Write(Spec {
+                    to_laptop: true,
+                    sources: vec![s("/server/report")],
+                    destination: p("~/Downloads"),
+                    allow: vec![],
+                }),
+            },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Progress },
             ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Ack(3) },
             ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Finish(Ok(())) },
             ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Finish(Err(s("connection lost"))) },

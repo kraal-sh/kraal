@@ -34,6 +34,8 @@ struct Request {
 }
 
 struct Prompt {
+    scroll: usize,
+    replacement: Option<(Vec<String>, crossbeam_channel::Sender<bool>)>,
     request: Request,
     scope: Scope,
     selected: usize,
@@ -56,6 +58,8 @@ struct CopyWorker {
     control: crossbeam_channel::Sender<ToClient>,
     cancelled: Arc<AtomicBool>,
     count: usize,
+    destination: Option<String>,
+    installed: bool,
 }
 
 pub struct Controller {
@@ -134,13 +138,19 @@ impl Controller {
                 }
             };
             let (ssh, _) = self.destination.as_ref().unwrap();
-            if state.allowed || paste::laptop_allowed(&self.permissions, ssh) {
+            let writing = request.copy.is_some() && !request.path.is_empty();
+            let remembered = if writing {
+                paste::laptop_write_allowed(&self.permissions, ssh)
+            } else {
+                paste::laptop_allowed(&self.permissions, ssh)
+            };
+            if state.allowed || remembered {
                 state.busy = true;
                 let generation = state.generation;
                 drop(state);
                 self.start(request, scope, generation);
             } else {
-                state.prompt = Some(Prompt { request, scope, selected: 0 });
+                state.prompt = Some(Prompt { scroll: 0, replacement: None, request, scope, selected: 0 });
                 drop(state);
                 self.draw();
             }
@@ -150,7 +160,11 @@ impl Controller {
 
     fn start(self: &Arc<Self>, request: Request, scope: Scope, generation: u64) {
         if let Some((token, sources)) = &request.copy {
-            self.start_copy(token.clone(), sources.clone(), scope, generation);
+            if request.path.is_empty() {
+                self.start_copy(token.clone(), sources.clone(), scope, generation);
+            } else {
+                self.start_write(token.clone(), sources.clone(), request.path, scope, generation);
+            }
             return;
         }
         let this = self.clone();
@@ -158,7 +172,20 @@ impl Controller {
         let spawned = crate::threads::named("laptop-list").spawn(move || {
             let result =
                 dirs::home_dir().ok_or_else(|| "Cannot find the laptop home directory".to_string()).and_then(|home| {
-                    crate::laptop::list(&request.path, &home, scope, cfg!(target_os = "macos"))
+                    let sensitivity = crate::laptop::listing_case_sensitive(&request.path, &home, scope);
+                    if let Ok(case_sensitive) = sensitivity {
+                        this.send_current(
+                            generation,
+                            &ClientMsg::LaptopCaseSensitive {
+                                pane: request.pane,
+                                side: request.side,
+                                request: request.request,
+                                case_sensitive,
+                            },
+                        );
+                    }
+                    sensitivity
+                        .and_then(|_| crate::laptop::list(&request.path, &home, scope, cfg!(target_os = "macos")))
                         .map_err(|e| format!("{e:#}. Press o to choose a directory"))
                 });
             this.finish(generation, request, result);
@@ -261,7 +288,24 @@ impl Controller {
 
     pub fn copy_message(self: &Arc<Self>, token: String, message: ToClient) {
         match message {
-            ToClient::Start { sources } => {
+            ToClient::Start { .. } | ToClient::Write(_) => {
+                let (sources, path) = match message {
+                    ToClient::Start { sources } => (sources, String::new()),
+                    ToClient::Write(spec) => {
+                        if spec.destination.as_os_str().is_empty() {
+                            self.send(&ClientMsg::LaptopCopy {
+                                token,
+                                message: FromClient::Finish(Err(
+                                    "Choose a laptop destination and retry the copy".into()
+                                )),
+                            });
+                            return;
+                        }
+                        (spec.sources, spec.destination.to_string_lossy().into_owned())
+                    }
+                    _ => unreachable!(),
+                };
+
                 if !crate::attachments::token_valid(&token) || sources.is_empty() || sources.len() > 100_000 {
                     return;
                 }
@@ -277,12 +321,12 @@ impl Controller {
                     pane: 0,
                     side: Side::Left,
                     request: 0,
-                    path: String::new(),
+                    path,
                 });
                 drop(state);
                 self.next();
             }
-            ToClient::Ack(_) => {
+            ToClient::Ack(_) | ToClient::Data { .. } => {
                 if let Some(worker) = self.state.lock().unwrap().copies.get(&token)
                     && worker.control.try_send(message).is_err()
                 {
@@ -296,13 +340,22 @@ impl Controller {
                     state.prompt = None;
                 }
                 if let Some(worker) = state.copies.remove(&token) {
+                    let result = if result.is_ok() && worker.destination.is_some() && !worker.installed {
+                        Err("Copy ended before installation: check the destination and retry".into())
+                    } else {
+                        result
+                    };
                     if result.is_err() {
                         worker.cancelled.store(true, Ordering::Release);
                     }
                     let _ = worker.control.try_send(ToClient::Finish(result.clone()));
                     let server = self.destination.as_ref().map_or("server", |(_, label)| label.as_str());
+                    let items = if worker.count == 1 { "item" } else { "items" };
                     let text = match result {
-                        Ok(()) => format!("{server} copied {} items from this laptop", worker.count),
+                        Ok(()) => match worker.destination {
+                            Some(path) => format!("{server} copied {} {items} to {}", worker.count, clean(&path)),
+                            None => format!("{server} copied {} {items} from this laptop", worker.count),
+                        },
                         Err(error) => format!("Laptop copy failed: {}", clean(&error)),
                     };
                     state.notice = Some((Instant::now() + Duration::from_secs(4), text));
@@ -336,15 +389,155 @@ impl Controller {
             if state.generation != generation {
                 return;
             }
-            state
-                .copies
-                .insert(token.clone(), CopyWorker { control, cancelled: cancelled.clone(), count: sources.len() });
+            state.copies.insert(
+                token.clone(),
+                CopyWorker {
+                    control,
+                    cancelled: cancelled.clone(),
+                    count: sources.len(),
+                    destination: None,
+                    installed: false,
+                },
+            );
         }
         let this = self.clone();
         let retry = token.clone();
         let spawned = crate::threads::named("laptop-copy").spawn(move || {
             let result = this.read_copy(&token, &sources, scope, generation, &cancelled, incoming);
             this.copy_read_finished(&token, generation, result);
+        });
+        if let Err(error) = spawned {
+            self.copy_read_finished(&retry, generation, Err(error.into()));
+        }
+    }
+
+    fn start_write(self: &Arc<Self>, token: String, sources: Vec<String>, path: String, scope: Scope, generation: u64) {
+        let (control, incoming) = crossbeam_channel::bounded(copy::WINDOW + 1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation != generation {
+                return;
+            }
+            state.copies.insert(
+                token.clone(),
+                CopyWorker {
+                    control,
+                    cancelled: cancelled.clone(),
+                    count: sources.len(),
+                    destination: Some(path.clone()),
+                    installed: false,
+                },
+            );
+        }
+        let this = self.clone();
+        let retry = token.clone();
+        let spawned = crate::threads::named("laptop-write").spawn(move || {
+            let result = (|| -> Result<()> {
+                let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
+                let spec = copy::Spec {
+                    to_laptop: true,
+                    sources: sources.clone(),
+                    destination: path.clone().into(),
+                    allow: Vec::new(),
+                };
+                let mut stage = crate::laptop::stage::Stage::new(&spec, &home, scope)?;
+                let replacements = stage.replacements();
+                if !replacements.is_empty() {
+                    let (answer, reply) = crossbeam_channel::bounded(1);
+                    {
+                        let mut state = this.state.lock().unwrap();
+                        ensure!(
+                            state.generation == generation && !cancelled.load(Ordering::Acquire),
+                            "Laptop copy cancelled"
+                        );
+                        state.prompt = Some(Prompt {
+                            scroll: 0,
+                            replacement: Some((replacements, answer)),
+                            request: Request {
+                                copy: Some((token.clone(), sources)),
+                                pane: 0,
+                                side: Side::Left,
+                                request: 0,
+                                path,
+                            },
+                            scope,
+                            selected: 1,
+                        });
+                    }
+                    this.draw();
+                    ensure!(
+                        reply.recv_timeout(copy::TIMEOUT).unwrap_or(false),
+                        "Replacement cancelled: nothing was copied. Press c to ask again"
+                    );
+                }
+                let check = || -> Result<()> {
+                    ensure!(!cancelled.load(Ordering::Acquire), "Laptop copy cancelled: retry from the file manager");
+                    Ok(())
+                };
+                check()?;
+                ensure!(
+                    this.send_current(
+                        generation,
+                        &ClientMsg::LaptopCopy { token: token.clone(), message: FromClient::Ack(0) }
+                    ),
+                    "Laptop connection lost"
+                );
+                let mut sequence = 0;
+                loop {
+                    check()?;
+                    let message = incoming
+                        .recv_timeout(copy::TIMEOUT)
+                        .map_err(|_| anyhow::anyhow!("Laptop copy stalled: retry from the file manager"))?;
+                    let ToClient::Data { sequence: received, packet } = message else {
+                        bail!("Laptop copy cancelled: retry from the file manager")
+                    };
+                    ensure!(received == sequence, "out-of-order laptop copy data");
+                    let done = stage.receive(packet)?;
+                    ensure!(
+                        this.send_current(
+                            generation,
+                            &ClientMsg::LaptopCopy { token: token.clone(), message: FromClient::Ack(sequence) }
+                        ),
+                        "Laptop connection lost"
+                    );
+                    sequence += 1;
+                    if done {
+                        break;
+                    }
+                }
+                let mut reported = Instant::now();
+                stage.install(|| {
+                    check()?;
+                    if reported.elapsed() >= Duration::from_millis(500) {
+                        ensure!(
+                            this.send_current(
+                                generation,
+                                &ClientMsg::LaptopCopy { token: token.clone(), message: FromClient::Progress }
+                            ),
+                            "Laptop connection lost"
+                        );
+                        reported = Instant::now();
+                    }
+                    Ok(())
+                })
+            })();
+            if result.is_ok() {
+                let mut state = this.state.lock().unwrap();
+                if state.generation == generation
+                    && let Some(worker) = state.copies.get_mut(&token)
+                {
+                    worker.installed = true;
+                }
+            }
+            this.send_current(
+                generation,
+                &ClientMsg::LaptopCopy {
+                    token: token.clone(),
+                    message: FromClient::Finish(result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"))),
+                },
+            );
+            this.copy_read_finished(&token, generation, Ok(()));
         });
         if let Err(error) = spawned {
             self.copy_read_finished(&retry, generation, Err(error.into()));
@@ -435,20 +628,34 @@ impl Controller {
             let Some(prompt) = state.prompt.as_mut() else {
                 break;
             };
+            let buttons = if prompt.replacement.is_some() { 2 } else { 3 };
             match event {
                 InputEvent::Key(key) => match key.code {
-                    KeyCode::Tab | KeyCode::Right => prompt.selected = (prompt.selected + 1) % 3,
-                    KeyCode::BackTab | KeyCode::Left => prompt.selected = (prompt.selected + 2) % 3,
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                        if prompt.replacement.is_some() =>
+                    {
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let view = self.view(prompt);
+                        let (max_scroll, page) = view.scroll_limits(Rect::new(0, 0, cols, rows.saturating_sub(1)));
+                        let step = if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) { page } else { 1 };
+                        prompt.scroll = if matches!(key.code, KeyCode::Up | KeyCode::PageUp) {
+                            prompt.scroll.min(max_scroll).saturating_sub(step)
+                        } else {
+                            prompt.scroll.saturating_add(step).min(max_scroll)
+                        };
+                    }
+                    KeyCode::Tab | KeyCode::Right => prompt.selected = (prompt.selected + 1) % buttons,
+                    KeyCode::BackTab | KeyCode::Left => prompt.selected = (prompt.selected + buttons - 1) % buttons,
                     KeyCode::Enter => {
                         answer = Some(prompt.selected);
                         break;
                     }
                     KeyCode::Esc => {
-                        answer = Some(2);
+                        answer = Some(buttons - 1);
                         break;
                     }
                     KeyCode::Char('c') if key.mods.ctrl => {
-                        answer = Some(2);
+                        answer = Some(buttons - 1);
                         break;
                     }
                     _ => {}
@@ -468,6 +675,12 @@ impl Controller {
         }
         if let Some(answer) = answer {
             let prompt = state.prompt.take().unwrap();
+            if let Some((_, reply)) = prompt.replacement {
+                let _ = reply.try_send(answer == 0);
+                drop(state);
+                self.send(&ClientMsg::Repaint);
+                return true;
+            }
             let retry = if prompt.request.copy.is_some() { "retry the copy" } else { "press r" };
             let mut error = None;
             if answer == 0 {
@@ -522,6 +735,23 @@ impl Controller {
     fn view(&self, prompt: &Prompt) -> View {
         let host = self.identity.as_ref().map_or("laptop", |i| i.host.as_str());
         let server = self.destination.as_ref().map_or("server", |(_, label)| label.as_str());
+        if let Some((names, _)) = &prompt.replacement {
+            return View {
+                title: format!("Replace files on {}?", clean(host)),
+                kind: NoticeKind::Warning,
+                error_start: None,
+                message: format!(
+                    "{server} asks to replace these items in {}. Folders are replaced in full. Cancel keeps everything as it is.",
+                    clean(&prompt.request.path)
+                ),
+                files: names.iter().map(|name| clean(name)).collect::<Vec<_>>().join("\n"),
+                transfer: None,
+                scroll: prompt.scroll,
+                buttons: vec!["Replace".into(), "Cancel".into()],
+                selected: prompt.selected,
+                keys: vec![("Enter", "Choose"), ("Tab", "Choose"), ("Esc", "Cancel")],
+            };
+        }
         let scope = if prompt.scope == Scope::All {
             "all directories your user can access"
         } else if cfg!(target_os = "macos") {
@@ -534,7 +764,7 @@ impl Controller {
             kind: NoticeKind::Notice,
             error_start: None,
             message: format!(
-                "{server}'s file manager asks to list and copy files from {scope}.\nCopying into this laptop, moving and deleting are not yet available.\nAllow lasts until this kraal attach ends. Always is kept in ~/.config/kraal/laptop-files.toml."
+                "{server}'s file manager asks to list and copy files in {scope}.\nReplacing anything on this laptop is asked in this box each time. Moving and deleting are not yet available.\nAllow lasts until this kraal attach ends. Always is kept in ~/.config/kraal/laptop-files.toml."
             ),
             transfer: None,
             files: String::new(),
@@ -797,6 +1027,8 @@ mod tests {
         let dir = TempDir::new("laptop-dialog");
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         let prompt = Prompt {
+            scroll: 0,
+            replacement: None,
             request: Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "server-controlled".into() },
             scope: Scope::Home,
             selected: 0,
@@ -809,7 +1041,7 @@ mod tests {
             if width >= 80 {
                 let text = crate::testing::buffer_text(&buf);
                 assert!(text.contains("Allow") && text.contains("Always for anvil") && text.contains("Cancel"));
-                assert!(text.contains("not yet available"));
+                assert!(text.contains("Replacing anything"));
             }
         }
     }
@@ -832,6 +1064,8 @@ mod tests {
         let dir = TempDir::new("laptop-frame");
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         client.state.lock().unwrap().prompt = Some(Prompt {
+            scroll: 0,
+            replacement: None,
             request: Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
             scope: Scope::Home,
             selected: 0,
@@ -926,6 +1160,9 @@ mod tests {
     fn chunk(peer: &mut impl std::io::Read) -> (PaneId, Side, u64, Vec<u8>, bool) {
         let (kind, bytes) = protocol::read_frame(peer).unwrap().unwrap();
         assert_eq!(kind, protocol::JSON);
+        if matches!(serde_json::from_slice::<ClientMsg>(&bytes).unwrap(), ClientMsg::LaptopCaseSensitive { .. }) {
+            return chunk(peer);
+        }
         let ClientMsg::LaptopListChunk { pane, side, request, data, done } = serde_json::from_slice(&bytes).unwrap()
         else {
             panic!("expected a listing chunk")
@@ -1229,12 +1466,16 @@ mod tests {
         let dir = TempDir::new("copy-notice");
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         let (control, _incoming) = crossbeam_channel::bounded(1);
-        client
-            .state
-            .lock()
-            .unwrap()
-            .copies
-            .insert("abc".into(), CopyWorker { control, cancelled: Arc::new(AtomicBool::new(false)), count: 3 });
+        client.state.lock().unwrap().copies.insert(
+            "abc".into(),
+            CopyWorker {
+                control,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                count: 3,
+                destination: None,
+                installed: false,
+            },
+        );
         client.copy_message("abc".into(), ToClient::Finish(Ok(())));
         assert_eq!(client.state.lock().unwrap().notice.as_ref().unwrap().1, "anvil copied 3 items from this laptop");
         assert!(!client.input(b"typing"));
@@ -1251,5 +1492,230 @@ mod tests {
                 Ok(true)
             })
             .unwrap();
+    }
+    #[test]
+    fn incoming_copy_replacement_always_asks_locally_and_cancel_writes_nothing() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::incoming_copy_replacement_always_asks_locally_and_cancel_writes_nothing",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("laptop-write-consent");
+        let home = dirs::home_dir().unwrap();
+        std::fs::write(home.join("report"), "old").unwrap();
+        let (client, _) = controller(dir.0.join("laptop-files.toml"));
+        let (ssh, label) = client.destination.as_ref().unwrap();
+        paste::remember_laptop(&client.permissions, ssh, label).unwrap();
+        let mut peer = pipe_peer(&client);
+        client.copy_message(
+            "abc".into(),
+            ToClient::Write(copy::Spec {
+                to_laptop: true,
+                sources: vec!["/server/report".into()],
+                destination: "~".into(),
+                allow: vec!["report".into()],
+            }),
+        );
+        let started = Instant::now();
+        loop {
+            if client.state.lock().unwrap().prompt.as_ref().is_some_and(|p| p.replacement.is_some()) {
+                break;
+            }
+            assert!(started.elapsed() < crate::testing::PATIENCE);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client
+            .output_with(b"SERVER REPLACE APPROVED", 80, 24, |bytes| {
+                let text = String::from_utf8_lossy(bytes);
+                assert!(text.contains("Replace files on travel?") && text.contains("anvil") && text.contains("report"));
+                assert!(text.find("SERVER REPLACE").unwrap() < text.find("Replace files").unwrap());
+                Ok(true)
+            })
+            .unwrap();
+        // Enter defaults to Cancel, and a pasted Replace shortcut cannot authorize it.
+        client.input(&paste::bracket(b"\t\r"));
+        assert!(client.state.lock().unwrap().prompt.is_some());
+        client.input(b"\r");
+        assert!(matches!(copy_packet(&mut peer).1, FromClient::Finish(Err(error)) if error.contains("cancelled")));
+        assert_eq!(std::fs::read_to_string(home.join("report")).unwrap(), "old");
+        assert!(
+            !std::fs::read_dir(&home)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(".kraal-stage-"))
+        );
+        assert!(paste::laptop_allowed(&client.permissions, ssh));
+    }
+
+    #[test]
+    fn incoming_copy_receives_only_after_preparation_and_finishes_without_server_approval() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::incoming_copy_receives_only_after_preparation_and_finishes_without_server_approval",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("laptop-write");
+        let (client, _) = controller(dir.0.join("laptop-files.toml"));
+        client.state.lock().unwrap().allowed = true;
+        let mut peer = pipe_peer(&client);
+        client.copy_message(
+            "abc".into(),
+            ToClient::Write(copy::Spec {
+                to_laptop: true,
+                sources: vec!["/server/report".into()],
+                destination: "~".into(),
+                allow: vec![],
+            }),
+        );
+        assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(0)));
+        let packets = [
+            Packet::Begin { bytes: 3, entries: 1 },
+            Packet::Entry(copy::Entry {
+                path: "report".into(),
+                kind: copy::Kind::File,
+                size: 3,
+                mode: 0o6755,
+                seconds: 1_600_000_000,
+                nanos: 0,
+            }),
+            Packet::Chunk("YWJj".into()),
+            Packet::End,
+            Packet::Done,
+        ];
+        for (sequence, packet) in packets.into_iter().enumerate() {
+            client.copy_message("abc".into(), ToClient::Data { sequence: sequence as u64, packet });
+            assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(received) if received == sequence as u64));
+        }
+        assert!(matches!(copy_packet(&mut peer).1, FromClient::Finish(Ok(()))));
+        assert_eq!(std::fs::read(dirs::home_dir().unwrap().join("report")).unwrap(), b"abc");
+        client.copy_message("abc".into(), ToClient::Finish(Ok(())));
+        assert_eq!(client.state.lock().unwrap().notice.as_ref().unwrap().1, "anvil copied 1 item to ~");
+    }
+    #[test]
+    fn incoming_partial_copy_disconnect_and_premature_success_remove_staging() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::incoming_partial_copy_disconnect_and_premature_success_remove_staging",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("laptop-write-interrupted");
+        let home = dirs::home_dir().unwrap();
+        for disconnect in [true, false] {
+            let (client, _) = controller(dir.0.join("laptop-files.toml"));
+            client.state.lock().unwrap().allowed = true;
+            let mut peer = pipe_peer(&client);
+            client.copy_message(
+                "abc".into(),
+                ToClient::Write(copy::Spec {
+                    to_laptop: true,
+                    sources: vec!["/server/report".into()],
+                    destination: "~".into(),
+                    allow: vec![],
+                }),
+            );
+            assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(0)));
+            client.copy_message(
+                "abc".into(),
+                ToClient::Data { sequence: 0, packet: Packet::Begin { bytes: 3, entries: 1 } },
+            );
+            assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(0)));
+            client.copy_message(
+                "abc".into(),
+                ToClient::Data {
+                    sequence: 1,
+                    packet: Packet::Entry(copy::Entry {
+                        path: "report".into(),
+                        kind: copy::Kind::File,
+                        size: 3,
+                        mode: 0o644,
+                        seconds: 0,
+                        nanos: 0,
+                    }),
+                },
+            );
+            assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(1)));
+            let staged = std::fs::read_dir(&home)
+                .unwrap()
+                .flatten()
+                .find(|e| e.file_name().to_string_lossy().starts_with(".kraal-stage-"))
+                .unwrap()
+                .path();
+            assert!(staged.join("payload/report").exists());
+            if disconnect {
+                client.disconnect();
+            } else {
+                client.copy_message("abc".into(), ToClient::Finish(Ok(())));
+                assert!(client.state.lock().unwrap().notice.as_ref().unwrap().1.contains("before installation"));
+            }
+            let started = Instant::now();
+            while staged.exists() {
+                assert!(started.elapsed() < crate::testing::PATIENCE, "cancelled stage was not removed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!home.join("report").exists());
+        }
+    }
+
+    #[test]
+    fn a_replacement_requires_local_allow_and_long_lists_can_be_scrolled() {
+        let dir = TempDir::new("laptop-replace-keys");
+        let (client, _) = controller(dir.0.join("laptop-files.toml"));
+        for cancel in [false, true] {
+            let (answer, reply) = crossbeam_channel::bounded(1);
+            client.state.lock().unwrap().prompt = Some(Prompt {
+                scroll: 0,
+                replacement: Some(((0..100).map(|n| format!("report-{n:03}")).collect(), answer)),
+                request: Request {
+                    copy: Some(("abc".into(), vec![])),
+                    pane: 0,
+                    side: Side::Left,
+                    request: 0,
+                    path: "~/Downloads".into(),
+                },
+                scope: Scope::Home,
+                selected: 1,
+            });
+            {
+                let state = client.state.lock().unwrap();
+                let view = client.view(state.prompt.as_ref().unwrap());
+                assert!(view.transfer.is_none());
+                assert!(view.title.starts_with("Replace files on "));
+            }
+            client.input(b"\x1b[6~");
+            assert!(client.state.lock().unwrap().prompt.as_ref().unwrap().scroll > 0);
+            client.input(b"\x1b[5~");
+            assert_eq!(client.state.lock().unwrap().prompt.as_ref().unwrap().scroll, 0);
+            client.input(if cancel { b"\x1b" } else { b"\t\r" });
+            client.input(b"");
+            assert_eq!(reply.recv_timeout(crate::testing::PATIENCE).unwrap(), !cancel);
+            assert!(client.state.lock().unwrap().prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn a_remembered_read_grant_still_asks_before_writing_to_the_laptop() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::a_remembered_read_grant_still_asks_before_writing_to_the_laptop",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("laptop-old-read-grant");
+        let path = dir.0.join("laptop-files.toml");
+        std::fs::write(&path, "[[laptop_copy]]\nname = 'anvil'\nssh = ['-p', '2222', 'me@anvil']\n").unwrap();
+        let (client, mut peer) = controller(path);
+        client.copy_message(
+            "abc".into(),
+            ToClient::Write(copy::Spec {
+                to_laptop: true,
+                sources: vec!["/server/report".into()],
+                destination: "~".into(),
+                allow: vec![],
+            }),
+        );
+        nothing(&mut peer);
+        assert!(client.state.lock().unwrap().prompt.as_ref().unwrap().replacement.is_none());
+        client.input(b"\x03");
+        assert!(matches!(copy_reply(&mut peer).1, FromClient::Finish(Err(_))));
+        assert!(!dirs::home_dir().unwrap().join("report").exists());
     }
 }

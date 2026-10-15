@@ -1143,7 +1143,7 @@ fn laptop_actions_are_explicitly_refused_and_only_one_panel_can_use_it() {
         assert!(matches!(pane.key(key), FilesAction::Refused(_)));
     }
     assert!(matches!(pane.key(FileKey::Tab), FilesAction::None));
-    assert!(matches!(pane.key(FileKey::Char('c')), FilesAction::Refused(why) if why.contains("not yet")));
+    assert!(!matches!(pane.key(FileKey::Char('c')), FilesAction::Refused(_)));
     pane.set_location(Side::Left, local(LEFT));
     assert!(pane.panel(Side::Left).owner.is_none());
     assert!(pane.set_laptop(Side::Right, laptop("~"), 7));
@@ -1179,4 +1179,39 @@ fn laptop_filter_accepts_letters_used_by_unavailable_actions() {
     assert!(matches!(pane.key(FileKey::Char('x')), FilesAction::Refused(_)));
     assert_eq!(pane.key(FileKey::Esc), FilesAction::Close);
     assert_eq!(pane.panel(Side::Left).filter, "secret.md");
+}
+
+#[test]
+fn laptop_replacements_follow_the_owners_directory_case_sensitivity() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    pane.set_viewer(7);
+    assert!(pane.set_laptop(Side::Right, laptop("~"), 7));
+    let request = pane.laptop_requests()[0].2;
+    pane.laptop_case_sensitive(8, Side::Right, request, false);
+    assert!(pane.panel(Side::Right).case_sensitive);
+    pane.laptop_case_sensitive(7, Side::Right, request + 1, false);
+    assert!(pane.panel(Side::Right).case_sensitive);
+    pane.laptop_case_sensitive(7, Side::Right, request, false);
+    pane.laptop_result(7, Side::Right, request, Ok(("~".into(), vec![file("REPORT", 1)])));
+    inject(&mut pane, Side::Left, local(LEFT), vec![file("report", 2)]);
+    pane.panel_mut(Side::Left).cursor = 1;
+    assert!(matches!(pane.transfer(Side::Left, false), FilesAction::Copy { replaces, .. } if replaces == ["report"]));
+    pane.panel_mut(Side::Right).case_sensitive = true;
+    assert!(matches!(pane.transfer(Side::Left, false), FilesAction::Copy { replaces, .. } if replaces.is_empty()));
+}
+
+#[test]
+fn copy_refreshes_only_its_owners_laptop_destination() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    pane.set_laptop(Side::Right, laptop("~/Downloads"), 7);
+    let request = pane.laptop_requests()[0].2;
+    pane.laptop_result(7, Side::Right, request, Ok(("~/Downloads".into(), vec![])));
+    pane.refresh_laptop(8, "~/Downloads");
+    pane.refresh_laptop(7, "~/Documents");
+    assert!(pane.laptop_requests().is_empty());
+    pane.refresh_laptop(7, "~/Downloads");
+    let requests = pane.laptop_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!((requests[0].0, requests[0].1, requests[0].3.as_str()), (7, Side::Right, "~/Downloads"));
+    assert_ne!(requests[0].2, request);
 }

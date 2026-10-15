@@ -160,6 +160,13 @@ impl Server {
                     self.mark_dirty();
                 }
             }
+            ClientMsg::LaptopCaseSensitive { pane, side, request, case_sensitive } => {
+                if self.clients.get(&id).is_some_and(|c| c.attached && c.laptop.is_some())
+                    && let Some(crate::pane::Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content)
+                {
+                    f.laptop_case_sensitive(id, side, request, case_sensitive);
+                }
+            }
             ClientMsg::LaptopListed { pane, side, request, result } => {
                 if self.clients.get(&id).is_some_and(|c| c.attached && c.laptop.is_some()) {
                     if let Some(crate::pane::Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) {
