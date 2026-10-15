@@ -2105,7 +2105,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         client.wait_for_row("Codex · second");
         client.send(b"\r");
         client.wait_for_row("Enter Back · Tab Actions");
-        let rows = client.wait_for_row("Usage unavailable");
+        let rows = client.wait_for_row("No usage yet");
         assert!(!rows.iter().any(|r| r.contains("0 panes")));
         client.close_overlay("Enter Back · Tab Actions");
         let added: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
