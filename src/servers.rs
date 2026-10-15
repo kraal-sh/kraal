@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 use crate::workspace::WorkspaceDef;
 
+const SERVERS_MAX: u64 = 1 << 20;
+
 /// What a tunnel forwards; kept across restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelSpec {
@@ -627,7 +629,7 @@ impl Inventory {
     }
 
     fn read(path: &Path) -> Result<(Inventory, Vec<String>)> {
-        let source = match std::fs::read_to_string(path) {
+        let source = match paths::read_regular_text(path, SERVERS_MAX) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -661,11 +663,17 @@ impl Inventory {
     }
 
     pub fn save(&self) -> Result<()> {
+        let text = self.text()?;
+        anyhow::ensure!(
+            text.len() as u64 <= SERVERS_MAX,
+            "writing {}: file is larger than {} KiB",
+            self.path.display(),
+            SERVERS_MAX / 1024
+        );
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        paths::write_atomic(&self.path, self.text()?.as_bytes())
-            .with_context(|| format!("writing {}", self.path.display()))
+        paths::write_atomic(&self.path, text.as_bytes()).with_context(|| format!("writing {}", self.path.display()))
     }
 
     /// Load the inventory, change it with `f` and save it if it changed, with no other kraal
@@ -930,6 +938,58 @@ pub fn groups(known: &[Known]) -> Vec<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_update_crossing_the_read_limit_preserves_the_original() {
+        let dir = crate::testing::TempDir::new("servers-save-limit");
+        let original = "#".to_owned() + &" ".repeat(SERVERS_MAX as usize - 2) + "\n";
+        let path = dir.write("servers.toml", &original);
+        assert!(Inventory::load_from(&path).unwrap().servers.is_empty());
+        let error = Inventory::update_at(&path, |inventory| {
+            inventory.add(toml::from_str("name = 'box'\nhost = 'box.test'\n")?)
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("larger than 1024 KiB"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(Inventory::load_from(&path).unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn loading_requires_bounded_regular_utf8_files() {
+        use crate::testing::{PATIENCE, TempDir};
+
+        let dir = TempDir::new("config-reader");
+        let path = dir.0.join("settings.toml");
+        assert!(Inventory::read(&path).is_ok(), "missing files keep their defaults");
+        let target = dir.write("regular.toml", "#".to_owned() + &" ".repeat(SERVERS_MAX as usize - 2) + "\n");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Inventory::read(&path).is_ok(), "a regular file at the limit, through a symlink");
+        std::fs::write(&target, "#".to_owned() + &" ".repeat(SERVERS_MAX as usize)).unwrap();
+        let error = Inventory::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("larger than 1024 KiB"));
+        std::fs::write(&target, [0xff]).unwrap();
+        let error = Inventory::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not UTF-8 text"));
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        let error = Inventory::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = Inventory::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        std::fs::remove_dir(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is terminated and belongs to this test.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(Inventory::read(&path).map(|_| ()).map_err(|e| format!("{e:#}"))).unwrap();
+        });
+        let error = rx.recv_timeout(PATIENCE).expect("a FIFO without a writer must not block").unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        worker.join().unwrap();
+    }
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()

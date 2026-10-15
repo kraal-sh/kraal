@@ -16,15 +16,20 @@ use crate::workspace::WorkspaceDef;
 
 impl Server {
     pub(super) fn refresh_known(&mut self, defs: &[WorkspaceDef]) {
-        let inv = match Inventory::load() {
+        self.config_generation += 1;
+        let hosts = if self.config.ssh_config_hosts { super::ssh_config_hosts() } else { Vec::new() };
+        self.apply_known(defs, Inventory::load(), &hosts);
+    }
+
+    pub(super) fn apply_known(&mut self, defs: &[WorkspaceDef], inventory: Result<Inventory>, hosts: &[String]) {
+        let inv = match inventory {
             Ok(inv) => inv,
             Err(e) => {
                 self.warnings.push(format!("{e:#}"));
                 Inventory::empty()
             }
         };
-        let hosts = if self.config.ssh_config_hosts { super::ssh_config_hosts() } else { Vec::new() };
-        self.known_servers = servers::known(&inv, defs, &hosts);
+        self.known_servers = servers::known(&inv, defs, hosts);
     }
 
     /// Resolve a name or `user@host[:port]` against the known servers.

@@ -509,6 +509,11 @@ pub struct Server {
     /// periodically.
     pub def_files: Vec<(PathBuf, String)>,
     last_def_scan: Instant,
+    config_generation: u64,
+    reload_generation: u64,
+    // The continuation owns the token, so a failed worker also releases the scan.
+    config_scan: std::rc::Weak<()>,
+    config_scan_again: bool,
     /// Servers from the inventory, workspaces and ~/.ssh/config.
     pub known_servers: Vec<crate::servers::Known>,
     /// ssh destinations already looked at for auto-adding.
@@ -861,6 +866,10 @@ pub fn run(session: &str) -> Result<()> {
         messages: Default::default(),
         def_files: Vec::new(),
         last_def_scan: Instant::now(),
+        config_generation: 0,
+        reload_generation: 0,
+        config_scan: Default::default(),
+        config_scan_again: false,
         known_servers: Vec::new(),
         discovered: Default::default(),
         accounts: crate::accounts::Accounts::empty(),
@@ -1571,8 +1580,8 @@ impl Server {
         if self.persist_dirty || due(now, self.last_persist, Duration::from_secs(30)) {
             self.persist_unless_writing();
         }
-        if due(now, self.last_def_scan, Duration::from_secs(5)) {
-            self.scan_definitions();
+        if due(now, self.last_def_scan, Duration::from_secs(5)) && self.config_scan.upgrade().is_none() {
+            self.scan_definitions_async();
         }
     }
 
@@ -1707,7 +1716,7 @@ impl Server {
             self.scan_polled = true;
         }
         if touched.config {
-            self.scan_definitions();
+            self.scan_definitions_async();
             self.reload_usage();
             self.check_limits();
         }
@@ -2108,6 +2117,10 @@ mod tests {
             messages: Default::default(),
             def_files: Vec::new(),
             last_def_scan: Instant::now(),
+            config_generation: 0,
+            reload_generation: 0,
+            config_scan: Default::default(),
+            config_scan_again: false,
             known_servers: Vec::new(),
             discovered: Default::default(),
             accounts: crate::accounts::Accounts::empty(),

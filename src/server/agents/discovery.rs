@@ -164,7 +164,12 @@ impl Server {
     }
 
     pub(in crate::server) fn reload_accounts(&mut self) {
-        match Accounts::load() {
+        self.config_generation += 1;
+        self.apply_accounts(Accounts::load());
+    }
+
+    pub(in crate::server) fn apply_accounts(&mut self, accounts: Result<Accounts>) {
+        match accounts {
             Ok(a) => {
                 self.follow_renamed_accounts();
                 self.accounts = a;
