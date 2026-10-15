@@ -128,18 +128,24 @@ impl Server {
                     _ => None,
                 };
                 if let Some(dir) = unknown {
-                    self.background(
+                    return match self.background_owned(
+                        reply,
                         move || {
                             let info = crate::git::status(&dir);
                             (dir, info)
                         },
-                        move |server, (dir, info)| {
+                        move |server, reply, (dir, info)| {
                             server.git_result(dir, info.map(Box::new));
                             let result = server.with_workspace_cleanup(|server| server.new_pane(req));
                             reply.complete(server, result);
                         },
-                    );
-                    return RequestOutcome::Deferred;
+                    ) {
+                        Ok(()) => RequestOutcome::Deferred,
+                        Err(reply) => RequestOutcome::Immediate {
+                            reply,
+                            result: Err("cannot start git lookup; try again".into()),
+                        },
+                    };
                 }
                 self.new_pane(req)
             }
@@ -173,13 +179,14 @@ impl Server {
                     .as_ref()
                     .is_some_and(|d| crate::worktree_setup::in_worktrees_dir(d) && !self.git.contains_key(d));
                 if let Some(dir) = dir.filter(|_| undecided || new_worktree) {
-                    self.background(
+                    return match self.background_owned(
+                        reply,
                         move || {
                             crate::git::project_path(&dir);
                             let info = new_worktree.then(|| crate::git::status(&dir)).flatten();
                             (dir, info)
                         },
-                        move |server, (dir, info)| {
+                        move |server, reply, (dir, info)| {
                             if info.is_some() {
                                 server.git_result(dir, info.map(Box::new));
                             }
@@ -188,8 +195,13 @@ impl Server {
                             });
                             reply.complete(server, result);
                         },
-                    );
-                    return RequestOutcome::Deferred;
+                    ) {
+                        Ok(()) => RequestOutcome::Deferred,
+                        Err(reply) => RequestOutcome::Immediate {
+                            reply,
+                            result: Err("cannot start git lookup; try again".into()),
+                        },
+                    };
                 }
                 self.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
             }
@@ -941,15 +953,22 @@ pub(super) mod tests {
                     }
                 };
                 super::super::jobs::FAIL_START.set(mode == "start failure");
-                assert!(matches!(server.request(id, req), RequestOutcome::Deferred));
+                let outcome = server.request(id, req);
                 assert!(receive.is_empty());
                 if mode == "start failure" {
+                    let RequestOutcome::Immediate { reply, result } = outcome else {
+                        panic!("a failed start must be answered");
+                    };
+                    reply.complete(&mut server, result);
+                    assert_eq!(response(&receive).unwrap_err(), "cannot start git lookup; try again");
                     assert!(server.jobs.is_empty());
-                    assert!(server.clients.contains_key(&id));
+                    assert!(!server.clients.contains_key(&id));
+                    assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
                     assert!(server.panes.is_empty());
                     assert_eq!(server.warnings, ["cannot start a background job: thread start failed"]);
                     continue;
                 }
+                assert!(matches!(outcome, RequestOutcome::Deferred));
                 if mode == "disconnected" {
                     server.drop_client(id);
                 }

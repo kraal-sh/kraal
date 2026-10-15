@@ -1665,13 +1665,13 @@ impl Server {
             Event::Emit(ty, fields) => self.emit(ty, fields),
             Event::Job(id, result) => {
                 let done = self.jobs.take(id);
-                match result {
-                    Ok(()) => {
-                        if let Some(done) = done {
-                            done(self);
-                        }
-                    }
-                    Err(panic) => self.warnings.push(format!("a background job failed: {}", panic_text(&*panic))),
+                let result = result.map_err(|panic| {
+                    let why = format!("a background job failed: {}", panic_text(&*panic));
+                    self.warnings.push(why.clone());
+                    why
+                });
+                if let Some(done) = done {
+                    done(self, result);
                 }
             }
             Event::RemoteAgents(conn, list) => self.remote_list(conn, list),
