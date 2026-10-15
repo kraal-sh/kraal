@@ -301,7 +301,7 @@ fn a_worktree_setup_is_not_run_again_after_a_restart() {
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"beta\"]\n\n[[account]]\nname=\"beta\"\nagent=\"claude\"\nhome={:?}\n",
+            "[[account]]\nid = 'test-claude-alpha'\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"beta\"]\n\n[[account]]\nid = 'test-claude-beta'\nname=\"beta\"\nagent=\"claude\"\nhome={:?}\n",
             home.display().to_string(), env.root.join("beta-home").display().to_string()
         ),
     )
@@ -370,7 +370,7 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            "[[account]]\nid = 'test-claude-alpha'\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
             home.display().to_string()
         ),
     )
@@ -522,7 +522,7 @@ fn all_of_a_worktree_setup_can_be_read_before_it_is_trusted() {
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            "[[account]]\nid = 'test-claude-alpha'\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
             home.display().to_string()
         ),
     )

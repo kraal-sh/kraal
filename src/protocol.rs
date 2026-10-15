@@ -6,7 +6,7 @@
 //! another kind is skipped.
 //!
 //! Peers must use the same protocol version. Only the upgrade control requests retain
-//! protocol 2 so 0.4 can inspect, save and stop 0.2.0 and 0.3.0 sessions.
+//! protocol 2 to inspect, save and stop 0.2.0 and 0.3.0 sessions.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use crate::agent::AgentState;
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Both released migration sources used protocol 2 and omitted it from Pong.
+/// Kraal 0.2.0 and 0.3.0 used protocol 2 and omitted it from Pong.
 pub const fn upgrade_protocol() -> u32 {
     2
 }

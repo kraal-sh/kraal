@@ -1,10 +1,9 @@
 #!/bin/sh
 # The cross-version test (tests/compat.rs): this kraal with sessions that other releases started,
-# refusing attachment in both directions, saving and stopping old servers, restarting them,
-# and checking one-way migration and
-# downgrade isolation against 0.2.0 and 0.3.0, or against the releases given:
+# refusing incompatible protocols and pre-0.4 state, saving and stopping old servers,
+# and restoring and restarting 0.4.x sessions, or testing the releases given:
 #
-#   tests/compat.sh                    # 0.2.0 and 0.3.0
+#   tests/compat.sh                    # 0.2.0, 0.3.0, 0.4.0 and 0.4.1
 #   tests/compat.sh v0.2.0             # one release
 #   tests/compat.sh --build v0.2.0     # built from its tag instead of downloaded
 #   tests/compat.sh --list             # which releases it would test
@@ -15,8 +14,8 @@
 # to the test binary (`tests/compat.sh -- --nocapture`).
 set -eu
 
-# Released clients, servers and migration sources (docs/compatibility.md).
-RELEASES="v0.2.0 v0.3.0"
+# Released clients, servers and saved state formats (docs/compatibility.md).
+RELEASES="v0.2.0 v0.3.0 v0.4.0 v0.4.1"
 
 repo=kraal-sh/kraal
 root=$(cd "$(dirname "$0")/.." && pwd)

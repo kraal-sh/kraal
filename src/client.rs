@@ -51,6 +51,7 @@ fn start(session: &str, kept: Option<std::os::fd::RawFd>) -> Result<PathBuf> {
     if listens() {
         return Ok(socket);
     }
+    crate::persist::inspect(session)?;
     // Said to who starts the server: its own list is shown to who attaches, and none may.
     if let Some(refused) = paths::runtime_dir_refused() {
         eprintln!("kraal: warning: {refused}");
@@ -323,7 +324,7 @@ pub(crate) fn request_connected(socket: &Path, mut stream: UnixStream, req: Requ
     }
 }
 
-/// Upgrade inspection of a server, including protocol 2 migration sources.
+/// Upgrade inspection of a server, including protocol 2 servers.
 pub fn upgrade_request_within(socket: &Path, req: Request, limit: Duration) -> Result<Response> {
     let deadline = Instant::now() + limit;
     let version = if matches!(req, Request::Ping) { protocol::upgrade_protocol() } else { ping(socket)?.protocol };
@@ -390,32 +391,14 @@ impl ServerInfo {
         protocol::version_mismatch(protocol::PROTOCOL_VERSION, self.protocol, &self.version, &self.session, host)
     }
 
-    /// A downgraded server saves separately: restarting it cannot replace newer state or undo Forget.
+    /// Older servers need the 0.4 disk conversion before this binary can restore them.
     pub fn check_restart(&self) -> Result<()> {
-        if self.protocol > protocol::upgrade_protocol() {
-            return Ok(());
-        }
-        let (session, version) = (&self.session, &self.version);
-        let saved = paths::session_state_path(session);
-        if saved.try_exists()? {
-            bail!(
-                "not restarting session {session}: newer saved state already exists in {}; \
-                 restarting kraal {version} would restore that state instead of this running session's layout and scrollback. \
-                 Keep any changes you need before stopping it with `kraal -s {session} kill`; \
-                 starting it on this kraal then restores the newer saved state",
-                saved.display()
-            );
-        }
-        let marker = saved.with_extension("forgotten");
-        if marker.try_exists()? {
-            bail!(
-                "not restarting session {session}: its legacy state was forgotten, as recorded in {}; \
-                 restarting kraal {version} would start an empty session instead of this running session's layout and scrollback. \
-                 Keep any changes you need before stopping it with `kraal -s {session} kill`; \
-                 to import the legacy state, remove that marker after stopping it and before starting it on this kraal",
-                marker.display()
-            );
-        }
+        anyhow::ensure!(
+            self.protocol > protocol::upgrade_protocol(),
+            "not restarting session {}: kraal {} saves state older than 0.4; run kraal 0.4 once first",
+            self.session,
+            self.version
+        );
         Ok(())
     }
 }
@@ -524,9 +507,11 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     let deadline = Instant::now() + STOP_TIMEOUT;
-    // A known server can refuse a restart when saving fails. Never replace that refusal
-    // with a signal that would lose the session.
-    let refusal_stands = restart && ping(socket).is_ok();
+    // A restart must verify that this binary can restore the server's saved state before
+    // asking it to stop, even when an earlier inspection timed out.
+    if restart {
+        ping(socket)?.check_restart()?;
+    }
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
     let (pid, uid) = process::socket_peer(&stream).context("finding the server process")?;
@@ -539,7 +524,8 @@ fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     let saved = match answer {
         Ok(Response::Text(why)) => Saved::No(why),
         Ok(_) => Saved::Yes,
-        Err(e) if refusal_stands => return Err(e),
+        // Never replace a restart refusal with a signal that would lose the session.
+        Err(e) if restart => return Err(e),
         Err(_) => {
             // SAFETY: plain signal to the process listening on our own private socket.
             if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
@@ -1784,51 +1770,70 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_server_cannot_restart_after_forget() {
-        let mut server = ServerInfo {
-            pid: 1,
-            session: format!("restart-forgotten-{}", crate::accounts::new_uuid()),
-            version: protocol::KRAAL_VERSION.into(),
-            protocol: 2,
-        };
-        let marker = paths::session_state_path(&server.session).with_extension("forgotten");
-        paths::ensure_private_dir(marker.parent().unwrap()).unwrap();
-        paths::write_private(&marker, b"").unwrap();
-        {
-            let err = server.check_restart().unwrap_err().to_string();
-            assert!(err.contains("was forgotten") && err.contains(&*marker.to_string_lossy()), "{err}");
-            assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
-            assert!(err.contains("remove") && err.contains("import the legacy state"), "{err}");
+    fn old_servers_require_the_previous_release_before_restart() {
+        let mut server = ServerInfo { pid: 1, session: "main".into(), version: "0.3.0".into(), protocol: 2 };
+        assert!(server.check_restart().unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
+        for protocol in [3, protocol::PROTOCOL_VERSION] {
+            server.protocol = protocol;
+            assert!(server.check_restart().is_ok());
         }
-        server.protocol = protocol::PROTOCOL_VERSION;
-        assert!(server.check_restart().is_ok(), "this format can save and restart after Forget");
-        assert_eq!(std::fs::read(&marker).unwrap(), b"");
-        std::fs::remove_file(marker).unwrap();
-        server.protocol = 2;
-        assert!(server.check_restart().is_ok(), "removing the marker allows migration again");
     }
 
     #[test]
-    fn a_legacy_server_cannot_restart_over_newer_saved_state() {
-        let mut server = ServerInfo {
-            pid: 1,
-            session: format!("restart-state-{}", crate::accounts::new_uuid()),
-            version: protocol::KRAAL_VERSION.into(),
-            protocol: 2,
-        };
-        assert!(server.check_restart().is_ok(), "the first upgrade can migrate the server's state");
-        let saved = paths::session_state_path(&server.session);
-        paths::ensure_private_dir(saved.parent().unwrap()).unwrap();
-        paths::write_private(&saved, b"newer state").unwrap();
-        {
-            let err = server.check_restart().unwrap_err().to_string();
-            assert!(err.contains("newer saved state") && err.contains(&*saved.to_string_lossy()), "{err}");
-            assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
+    fn delayed_old_servers_are_not_stopped_for_restart() {
+        use std::os::unix::net::UnixListener;
+
+        for version in ["0.2.0", "0.3.0"] {
+            let session = format!("delayed-{version}");
+            let socket = paths::socket_path(&session);
+            paths::ensure_private_dir(socket.parent().unwrap()).unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut pings = 0;
+                let mut stopped = false;
+                while pings < 4 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(crate::testing::PATIENCE)).unwrap();
+                    let (_, payload) = protocol::read_frame(&mut stream).unwrap().unwrap();
+                    let ClientMsg::Request { request, .. } = serde_json::from_slice(&payload).unwrap() else {
+                        panic!("expected a request");
+                    };
+                    let result = match request {
+                        Request::Ping => {
+                            pings += 1;
+                            if pings <= 2 {
+                                // Both restart preflights time out before the old server recovers.
+                                assert!(protocol::read_frame(&mut stream).unwrap().is_none());
+                                continue;
+                            }
+                            Ok(Response::Pong {
+                                pid: std::process::id(),
+                                session: session.clone(),
+                                version: version.into(),
+                                protocol: 2,
+                            })
+                        }
+                        Request::KillServer { restart: true } => {
+                            stopped = true;
+                            // Report the forbidden request without stopping the test process.
+                            Err("restart stop request reached the old server".into())
+                        }
+                        _ => panic!("unexpected request: {request:?}"),
+                    };
+                    protocol::write_json(&mut stream, &ServerMsg::Response { result }).unwrap();
+                }
+                stopped
+            });
+            // The CLI's inspection, followed by restart_server's inspection and final stop check.
+            assert!(ping(&socket).is_err());
+            let result = restart_server(&format!("delayed-{version}"));
+            let recovered = ping(&socket).unwrap();
+            let stopped = server.join().unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            assert_eq!(recovered.version, version);
+            assert!(!stopped, "restart sent a stop request to kraal {version}");
+            assert!(result.unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
         }
-        server.protocol = protocol::PROTOCOL_VERSION;
-        assert!(server.check_restart().is_ok(), "a server using this format can restart on its own state");
-        assert_eq!(std::fs::read(&saved).unwrap(), b"newer state");
-        std::fs::remove_file(saved).unwrap();
     }
 
     #[test]

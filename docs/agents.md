@@ -540,26 +540,23 @@ an internal `id`, and a `threshold` of its own if it has one), which `kraal acco
 not been verified also has `sign_in_required = true`; successful verification removes that flag.
 Pending reviews have `review = true` and may keep a `public_identity` supplied by the agent.
 Former names, identities and homes are stored in `[[account.references]]` under their owner,
-including notes and unknown keys. Old files with separate `linked_to` account entries are
-compacted on their next rewrite, with the original kept in `accounts.toml.kraal-bak`. Once a
-review is resolved there is one `[[account]]` per account in the list. References whose account
-was removed have no owner; they are kept in `[[forgotten]]` to prevent rediscovery and identity
-reuse, not as account entries. Keep these generated fields. No home or credential is removed.
-See [Compatibility](compatibility.md) for migration and clients of different versions.
-kraal edits what it changes there and leaves the rest as you wrote it, including comments, order
-and unknown keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
-table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
-empty `[claude]` table, keeping their comments and leaving one blank line where the
-surrounding separators meet. A `[claude]` table with a saved `statusline`
-command or other settings stays, as do existing rules. A file that cannot be parsed is left
-untouched. Kraal 0.4 reads files from 0.2.0 and 0.3.0 without identifiers. On the next rewrite,
-it adds identifiers and binds existing rules to them, keeping a first backup as `accounts.toml.kraal-bak`.
-This one-way migration is removed in 0.5.0; run kraal 0.4 once first to convert an older file.
-Before changing accounts, this migration also copies legacy usage to identity-based caches and binds
-readable closed sessions and workspace definitions in the configured directories. This includes saved
-layout Undo in both kept and deleted workspaces, so restoring a previous layout keeps the same account
-even after its name is reused. If preparation fails, `accounts.toml` stays unchanged; fix the reported
-file or directory and retry. The legacy usage files stay available to older running servers.
+including notes and unknown keys. Separate `linked_to` entries are compacted on their next
+rewrite. Once a review is resolved there is one `[[account]]` per account in the list.
+References whose account was removed have no owner; they are kept in `[[forgotten]]` to prevent
+rediscovery and identity reuse, not as account entries. Keep these generated fields.
+No home or credential is removed. See [Compatibility](compatibility.md) for saved formats and
+clients of different versions.
+
+Kraal edits what it changes and leaves the rest as you wrote it, including comments, order and
+unknown keys. A new file includes an explanatory header and omits empty rules and an empty
+`[claude]` table. A file that cannot be parsed is left untouched. Account commands refuse files
+with accounts without identities, as written by 0.2.0 and 0.3.0, with
+`run kraal 0.4 once first`. Kraal 0.5 does not convert them or create a backup.
+Usage is read from `usage/by-id`; old name-based caches are left untouched.
+Account changes do not rewrite saved sessions or external workspace definitions.
+Identity resolution during ordinary account and workspace operations keeps retained references
+and homes associated with their account after renames or removals.
+
 Rules accept bare names and `agent:name`; kraal writes resolved
 references as `agent:@id`. Workspace files keep the readable `agent="claude:name"` and add
 `account_id` when bound or saved. These are generated details: keep them when editing a label;

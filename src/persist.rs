@@ -21,8 +21,6 @@ use crate::pane::PaneSpec;
 use crate::paths;
 use crate::server::{FloatRect, Floating, Server, Tab};
 
-pub(crate) mod migration;
-
 const VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -603,37 +601,21 @@ fn made_by_kraal(name: &str) -> bool {
     }
 }
 
-/// Forget current state without allowing the untouched legacy session to return.
+/// Forget the current saved state.
 pub fn forget(session: &str) -> Result<bool> {
-    forget_from(&paths::session_state_path(session), &paths::legacy_session_state_path(session)).with_context(|| {
+    forget_from(&paths::session_state_path(session)).with_context(|| {
         format!("could not finish forgetting session {session}; fix the state directory and retry `kraal -s {session} forget`")
     })
 }
 
-fn forget_from(path: &Path, legacy: &Path) -> Result<bool> {
-    let marker = path.with_extension("forgotten");
-    let legacy_exists = match std::fs::symlink_metadata(legacy) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()),
-    };
-    let newly_forgotten = legacy_exists && !marker.try_exists()?;
-    if legacy_exists {
-        // Record this before removing current state, so an interrupted Forget cannot reimport it.
-        let dir = path.parent().context("no directory for the state")?;
-        durable_dir(dir)?;
-        if newly_forgotten {
-            paths::write_private(&marker, b"")?;
-        }
-        sync_directory(dir)?;
-    }
+fn forget_from(path: &Path) -> Result<bool> {
     paths::remove_abandoned_temps(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => {
             sync_directory(path.parent().unwrap())?;
             Ok(true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(newly_forgotten),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
@@ -654,41 +636,28 @@ fn scrollback_name(file: &str) -> bool {
         && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Inspect a stopped session without converting its state.
+/// Inspect a stopped session.
 pub fn inspect(session: &str) -> Result<Option<SessionSnapshot>> {
-    read_session(session, false)
+    read_session(session)
 }
 
 pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
-    read_session(session, true).with_context(|| {
+    read_session(session).with_context(|| {
         format!("could not restore {}; the saved session is unchanged", paths::session_state_path(session).display())
     })
 }
 
-fn read_session(session: &str, convert: bool) -> Result<Option<SessionSnapshot>> {
-    read_from(
-        &paths::session_state_path(session),
-        &paths::legacy_session_state_path(session),
-        &paths::scrollback_dir(session),
-        convert,
-    )
+fn read_session(session: &str) -> Result<Option<SessionSnapshot>> {
+    read_from(&paths::session_state_path(session), &paths::legacy_session_state_path(session))
 }
 
-fn read_from(path: &Path, legacy: &Path, scrollback: &Path, convert: bool) -> Result<Option<SessionSnapshot>> {
+fn read_from(path: &Path, legacy: &Path) -> Result<Option<SessionSnapshot>> {
     if let Some(data) = read_state(path)? {
-        return migration::read_current(path, &data, convert)
-            .map(Some)
-            .with_context(|| format!("reading {}", path.display()));
-    }
-    if path.with_extension("forgotten").try_exists()? {
-        return Ok(None);
+        return parse(&data).map(Some).with_context(|| format!("reading {}", path.display()));
     }
     let Some(data) = read_state(legacy)? else { return Ok(None) };
     let version = state_version(&data)?;
     anyhow::ensure!(version <= 1, "unsupported state version {version} in {}; use a newer kraal", legacy.display());
-    if version == 1 {
-        return migration::read(legacy, &data, path, scrollback, convert).map(Some);
-    }
     anyhow::bail!("state predates kraal 0.4; run kraal 0.4 once first")
 }
 
@@ -717,16 +686,13 @@ fn parse(data: &[u8]) -> Result<SessionSnapshot> {
     anyhow::ensure!(version >= VERSION, "state predates kraal 0.4; run kraal 0.4 once first");
     anyhow::ensure!(version == VERSION, "unsupported state version {}; use a newer kraal", version);
     let snap: SessionSnapshot = serde_json::from_slice(data)?;
-    validate(&snap, data, false)?;
+    validate(&snap, data)?;
     Ok(snap)
 }
 
-fn validate(snap: &SessionSnapshot, data: &[u8], missing_ids: bool) -> Result<()> {
+fn validate(snap: &SessionSnapshot, data: &[u8]) -> Result<()> {
     let mut ids = HashSet::new();
     for ws in snap.workspaces.iter().chain(snap.deleted_workspaces.iter().map(|d| &d.workspace)) {
-        if missing_ids && ws.id.is_empty() {
-            continue;
-        }
         anyhow::ensure!(
             !ws.id.is_empty()
                 && ws.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
@@ -1078,6 +1044,47 @@ mod tests {
     }
 
     #[test]
+    fn old_state_is_refused_and_current_state_takes_precedence() {
+        let dir = std::env::temp_dir().join(format!("kraal-state-refusal-{}", crate::accounts::new_uuid()));
+        let current = dir.join("sessions-v2/main.json");
+        let legacy = dir.join("sessions/main.json");
+        let scrollback = dir.join("scrollback/main/1-2-3.ans");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(scrollback.parent().unwrap()).unwrap();
+        std::fs::write(&scrollback, b"saved output").unwrap();
+        for version in [0, 1] {
+            let bytes = serde_json::to_vec(&serde_json::json!({"version": version, "workspaces": []})).unwrap();
+            std::fs::write(&legacy, &bytes).unwrap();
+            let error = read_from(&current, &legacy).unwrap_err();
+            assert!(error.to_string().ends_with("run kraal 0.4 once first"), "{error:#}");
+            assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+            assert_eq!(std::fs::read(&scrollback).unwrap(), b"saved output");
+            assert!(!current.parent().unwrap().exists());
+        }
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        let definition = dir.join("source.kdl");
+        std::fs::write(&definition, "layout { pane; }").unwrap();
+        let mut saved = saved_state();
+        saved["workspaces"][0]["definition"] = serde_json::json!(definition);
+        saved["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        std::fs::write(&current, &bytes).unwrap();
+        let loaded = read_from(&current, &legacy).unwrap().unwrap();
+        assert_eq!(loaded.version, VERSION);
+        assert!(loaded.workspaces[0].definition_source.is_none());
+        assert_eq!(std::fs::read(&current).unwrap(), bytes);
+        std::fs::write(&current, br#"{"version":3}"#).unwrap();
+        assert!(format!("{:#}", read_from(&current, &legacy).unwrap_err()).ends_with("use a newer kraal"));
+        assert_eq!(std::fs::read(&current).unwrap(), br#"{"version":3}"#);
+        assert!(forget_from(&current).unwrap());
+        assert!(!forget_from(&current).unwrap());
+        assert!(read_from(&current, &legacy).unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
+        assert_eq!(std::fs::read_dir(current.parent().unwrap()).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&scrollback).unwrap(), b"saved output");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn duplicate_keeps_shell_stopped_state_and_stops_commands() {
         for (stopped, command) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut snap: SessionSnapshot = serde_json::from_value(saved_state()).unwrap();
@@ -1322,7 +1329,6 @@ mod tests {
             let bytes = serde_json::to_vec(&value).unwrap();
             assert!(serde_json::from_slice::<SessionSnapshot>(&bytes).is_ok(), "Serde accepts positional structs");
             assert_state_refused(&bytes, reason);
-            assert!(migration::bind_saved_accounts(&bytes, &crate::accounts::Accounts::empty()).unwrap().is_none());
         }
     }
 
