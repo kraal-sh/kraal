@@ -375,8 +375,9 @@ This text is written to disk, readable by you alone, in `~/.local/state/kraal/sc
 and it can hold secrets (a token printed by a command, a password echoed by mistake):
 `save_scrollback = false` in the config stops saving it and deletes what was saved (kraal deletes
 only the files it wrote there, and nothing through a link put in place of that directory).
-`kraal forget` deletes the current saved layout and scrollback of a stopped session. Original
-files from before 0.4 stay available for [recovery](compatibility.md#saved-files-and-sessions). Paste buffers are
+`kraal forget` deletes the current saved state, scrollback, attachments and saved paste buffers
+of a stopped session. Original files from before 0.4 stay available for
+[recovery](compatibility.md#saved-files-and-sessions). Paste buffers are
 not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 
 ### Workspace identities
@@ -397,8 +398,8 @@ Without a current session file, start, attach and restore refuse old state with
 If reading or validating state fails, kraal leaves it in place and refuses to start the session.
 Fix the reported cause and retry. See [Compatibility](compatibility.md#saved-files-and-sessions).
 
-`kraal forget` removes current state and scrollback only. If old state remains, the next
-start refuses it with the same next step. Account changes do not rewrite saved sessions
+`kraal forget` removes current state, scrollback, attachments and saved paste buffers. If old
+state remains, the next start refuses it with the same next step. Account changes do not rewrite saved sessions
 or external workspace files. See [Accounts](agents.md#accounts).
 
 A workspace whose panes cannot be restored keeps its identity, layout, source and failure reason.

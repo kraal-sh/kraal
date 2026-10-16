@@ -141,7 +141,7 @@ pub enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Forget a session's saved layout and scrollback (and its paste buffers, when they are kept).
+    /// Delete a stopped session's current state, scrollback, attachments and saved paste buffers.
     Forget,
     /// List saved workspaces and definitions, or manage a workspace.
     #[command(alias = "ws", args_conflicts_with_subcommands = true)]
@@ -840,6 +840,18 @@ mod tests {
         let not_text: OsString = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
         assert!(Cli::plain(&[OsString::from("attach"), not_text]).is_none());
     }
+    #[test]
+    fn forget_help_names_every_kind_of_saved_data_it_deletes() {
+        for flag in ["-h", "--help"] {
+            let error = Cli::try_parse_from(["kraal", "forget", flag]).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = error.to_string();
+            for kind in ["state", "scrollback", "attachments", "saved paste buffers"] {
+                assert!(help.contains(kind), "forget {flag} does not name {kind}: {help}");
+            }
+        }
+    }
+
     #[test]
     fn laptop_copy_helper_is_hidden_and_installs_literal_approved_names() {
         use clap::CommandFactory;

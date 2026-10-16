@@ -32,9 +32,6 @@ pub(in crate::server) fn apply(server: &mut Server, mut snap: SessionSnapshot) -
     snap.workspaces
         .sort_by_key(|w| WorkspaceKey::position(&server.workspace_order, Some(&w.id), w.definition.as_deref()));
     for mut ws in snap.workspaces {
-        if ws.id.is_empty() {
-            ws.id = crate::identity::new_uuid();
-        }
         ws.bind_accounts(&server.accounts);
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
