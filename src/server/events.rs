@@ -187,15 +187,18 @@ impl Hooks {
         Hooks { list, ..Default::default() }
     }
 
-    /// Forget finished hooks; stop (with everything they started) those running too long. A hook
-    /// runs until its process group is empty: what it left in the background still counts.
+    /// Forget finished hooks; stop their process groups when they run too long. A hook runs
+    /// until its group has no live members: what it left in the background still counts.
     pub fn reap(&mut self) {
         self.running.retain_mut(|h| {
-            let done = matches!(h.child.try_wait(), Ok(Some(_))) && !crate::exec::group_alive(&h.child);
+            // Keep the leader unreaped until the last possible signal, so its group id stays ours.
+            let done = crate::exec::has_exited(&h.child) && !crate::exec::group_alive(&h.child);
             if !done && h.started.elapsed() <= MAX_RUNTIME {
                 return true;
             }
-            if !done {
+            if done {
+                let _ = h.child.wait();
+            } else {
                 crate::exec::kill_group(&mut h.child);
             }
             h.log_output();
@@ -699,5 +702,130 @@ mod tests {
             assert!(h.admit().is_ok());
         }
         assert_eq!(h.admit(), Err("too many events at once"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hooks_keep_work_forked_during_the_group_scan() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::rc::Rc;
+
+        let (input, release_leader) = std::io::pipe().unwrap();
+        let child =
+            crate::exec::own_group(Command::new("sh").args(["-c", "read release"])).stdin(input).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let (input, release_member) = std::io::pipe().unwrap();
+        let mut member = Command::new("sh")
+            .args(["-c", "exec 3<&0; read fork; sh -c 'read release' <&3 & echo $!; exit 0"])
+            .process_group(pid)
+            .stdin(input)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(member.stdout.take().unwrap());
+        let member = Rc::new(member);
+        let mut hooks = Hooks::default();
+        hooks.running.push(Running { child, started: Instant::now(), output: None, log: PathBuf::new() });
+        drop(release_leader);
+        let start = Instant::now();
+        while !crate::exec::has_exited(&hooks.running[0].child) && start.elapsed() < crate::testing::PATIENCE {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(crate::exec::has_exited(&hooks.running[0].child));
+        let parent = member.clone();
+        let mut fork = release_member.try_clone().unwrap();
+        crate::process::AFTER_GROUP_ENUMERATION.with(|after| {
+            *after.borrow_mut() = Some(Box::new(move || {
+                // The enumerated parent forks a reader absent from that list, then becomes a zombie.
+                writeln!(fork, "fork").unwrap();
+                let start = Instant::now();
+                while !crate::exec::has_exited(&parent) && start.elapsed() < crate::testing::PATIENCE {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(crate::exec::has_exited(&parent));
+            }));
+        });
+        hooks.reap();
+        let busy = hooks.busy();
+        let unreaped = hooks.running.first().is_some_and(|h| crate::exec::has_exited(&h.child));
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        let successor = line.trim().parse().unwrap();
+        let successor_running = crate::process::running(successor);
+        // SAFETY: getpgid only reads the process table.
+        let successor_group = unsafe { libc::getpgid(successor) };
+        hooks.stop_all();
+        // Keep the reader blocked to check shutdown's signal. On regression, release it so
+        // even a hook that was forgotten cannot leave this test's background work running.
+        let release_member = busy.then_some(release_member);
+        Rc::try_unwrap(member).unwrap().wait().unwrap();
+        let start = Instant::now();
+        while crate::process::running(successor) && start.elapsed() < crate::testing::PATIENCE {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cleaned_up = !crate::process::running(successor);
+        drop(release_member);
+        assert!(cleaned_up, "the successor was cleaned up");
+        assert!(successor_running, "the successor is still waiting in the hook's group");
+        assert_eq!(successor_group, pid);
+        assert!(busy, "a fork during the scan must keep the hook supervised");
+        assert!(unreaped, "the leader must still reserve its pid");
+    }
+
+    #[test]
+    fn hooks_keep_the_leader_until_background_work_ends_or_is_stopped() {
+        for ending in ["finished", "timeout", "shutdown"] {
+            let (input, release) = std::io::pipe().unwrap();
+            let mut release = Some(release);
+            let child =
+                crate::exec::own_group(Command::new("sh").args(["-c", "exec 3<&0; sh -c 'read release' <&3 & exit 3"]))
+                    .stdin(input)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+            let pid = child.id() as libc::pid_t;
+            let mut hooks = Hooks::default();
+            hooks.running.push(Running { child, started: Instant::now(), output: None, log: PathBuf::new() });
+            let start = Instant::now();
+            while !crate::exec::has_exited(&hooks.running[0].child) && start.elapsed() < crate::testing::PATIENCE {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(crate::exec::has_exited(&hooks.running[0].child));
+            // The shell has exited, but its background reader cannot exit before we close the pipe.
+            hooks.reap();
+            assert!(hooks.busy(), "{ending}: background work still counts");
+            let unreaped = crate::exec::has_exited(&hooks.running[0].child);
+            match ending {
+                "finished" => {
+                    drop(release.take());
+                    let start = Instant::now();
+                    while crate::process::group_running(pid) && start.elapsed() < crate::testing::PATIENCE {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    hooks.reap();
+                }
+                "timeout" => {
+                    hooks.running[0].started = Instant::now() - MAX_RUNTIME - Duration::from_secs(1);
+                    hooks.reap();
+                }
+                _ => {
+                    hooks.stop_all();
+                }
+            }
+            let busy = hooks.busy();
+            hooks.stop_all();
+            assert!(unreaped, "{ending}: the leader must reserve its pid until the last possible signal");
+            assert!(!busy, "{ending}: supervision ended");
+            // SAFETY: this is the test's child; WNOHANG never blocks.
+            assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            let start = Instant::now();
+            while crate::process::group_running(pid) && start.elapsed() < crate::testing::PATIENCE {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!crate::process::group_running(pid), "{ending}: no background work remains");
+        }
     }
 }
