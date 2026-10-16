@@ -466,7 +466,9 @@ a turn before changing accounts. Transcript searches, checks and copies run in t
 Kraal refuses a destination whose account home is in use by another process, or whose separate
 transcript is open in another process. Stop that agent before trying again. Shared transcripts
 need no copy. Transfers of the same conversation lock both account stores; another transfer
-must finish before retrying.
+must finish before retrying. Finishing or failing a transfer releases its locks even while
+a child process is still starting. The lock files remain in `projects`; their presence alone
+does not mean a transfer is running.
 
 When replacing an older destination transcript, kraal checks the revision it actually moved
 and keeps that file at `projects/<project>/.kraal-transfer-<id>-<unique>/previous.jsonl` in the

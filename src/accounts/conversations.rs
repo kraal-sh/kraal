@@ -413,6 +413,74 @@ mod tests {
     }
 
     #[test]
+    fn transfer_locks_release_while_a_child_waits_to_exec() {
+        // A deliberately stalled child must not retain other tests' descriptors.
+        if !crate::testing::in_own_process(
+            "accounts::conversations::tests::transfer_locks_release_while_a_child_waits_to_exec",
+        ) {
+            return;
+        }
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let t = Transfer::new();
+        let held = transfer_locks(&t.from, &t.to, "session").unwrap();
+        let fds: Vec<_> = held.iter().map(|lock| lock.0.as_raw_fd()).collect();
+        let (mut ready, ready_end) = std::io::pipe().unwrap();
+        let (release, mut release_end) = std::io::pipe().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut command = Command::new("true");
+            // SAFETY: the child only checks inherited descriptors and uses pipes before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    for fd in &fds {
+                        let flags = libc::fcntl(*fd, libc::F_GETFD);
+                        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+                            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                        }
+                    }
+                    if libc::write(ready_end.as_raw_fd(), b"r".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut wait = libc::pollfd { fd: release.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    loop {
+                        match libc::poll(&mut wait, 1, crate::testing::PATIENCE.as_millis() as _) {
+                            0 => return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+                            n if n > 0 => break,
+                            _ => {
+                                let error = std::io::Error::last_os_error();
+                                if error.kind() != std::io::ErrorKind::Interrupted {
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(release.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.status()
+        });
+        let inherited = ready.read_exact(&mut [0]);
+        let competing = transfer_locks(&t.to, &t.from, "session").map(drop);
+        drop(held);
+        let again = transfer_locks(&t.from, &t.to, "session").map(drop);
+        let reverse = transfer_locks(&t.to, &t.from, "session").map(drop);
+        let released = release_end.write_all(b"r");
+        let status = worker.join().unwrap();
+        inherited.unwrap();
+        released.unwrap();
+        assert!(status.unwrap().success());
+        assert!(competing.unwrap_err().to_string().contains("another kraal"));
+        again.unwrap();
+        reverse.unwrap();
+    }
+
+    #[test]
     fn destination_changes_after_comparison_are_preserved_and_refused() {
         for replace in [false, true] {
             let t = Transfer::new();
