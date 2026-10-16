@@ -12,25 +12,50 @@ pub(super) fn source_missing(error: &anyhow::Error) -> bool {
 
 impl Server {
     pub(super) fn refresh_source_status(&mut self) {
+        let sources = self
+            .workspaces
+            .iter()
+            .filter_map(|ws| {
+                let path = ws.definition.as_ref()?;
+                Some((path.clone(), workspace::ImportPreview::read(path)))
+            })
+            .collect::<Vec<_>>();
+        if self.apply_source_status(&sources) {
+            self.refresh_workspace_pickers();
+        }
+    }
+
+    pub(super) fn apply_source_status(
+        &mut self,
+        sources: &[(std::path::PathBuf, anyhow::Result<workspace::ImportPreview>)],
+    ) -> bool {
         let mut changed = Vec::new();
         for ws in &mut self.workspaces {
-            let status = ws.definition.as_ref().and_then(|path| match workspace::ImportPreview::read(path) {
-                Ok(preview) => {
+            let preview = match &ws.definition {
+                Some(path) => {
+                    let Some((_, preview)) = sources.iter().find(|(p, _)| p == path) else { continue };
+                    Some(preview)
+                }
+                None => None,
+            };
+            let status = match preview {
+                Some(Ok(preview)) => {
                     let source = preview.revision.bytes.as_deref();
                     (source != ws.definition_source.as_deref().map(str::as_bytes)
                         && source != ws.source_reviewed.as_deref().map(str::as_bytes))
                     .then_some(("File changed", NoticeKind::Notice))
                 }
-                Err(e) if source_missing(&e) => Some(("Source file missing", NoticeKind::Warning)),
-                Err(_) => Some(("File error", NoticeKind::Error)),
-            });
+                Some(Err(e)) if source_missing(e) => Some(("Source file missing", NoticeKind::Warning)),
+                Some(Err(_)) => Some(("File error", NoticeKind::Error)),
+                None => None,
+            };
             if status.map(|(text, _)| text) != ws.source_status {
                 ws.source_status = status.map(|(text, _)| text);
                 changed.push((ws.id, status));
             }
         }
         if changed.is_empty() {
-            return;
+            return false;
         }
         for (ws, status) in changed {
             if let Some((status, kind)) = status {
@@ -42,8 +67,8 @@ impl Server {
                 }
             }
         }
-        self.refresh_workspace_pickers();
         self.mark_dirty();
+        true
     }
 
     pub(super) fn keep_source_layout(&mut self, ws: u32, preview: &workspace::ImportPreview) -> anyhow::Result<()> {

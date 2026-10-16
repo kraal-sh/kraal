@@ -12,6 +12,7 @@ mod buffers;
 mod clients;
 mod clipboard;
 mod commands;
+mod config_scan;
 mod contexts;
 mod definitions;
 mod dirwatch;
@@ -514,6 +515,8 @@ pub struct Server {
     // The continuation owns the token, so a failed worker also releases the scan.
     config_scan: std::rc::Weak<()>,
     config_scan_again: bool,
+    config_inputs: Option<config_scan::Inputs>,
+    config_scan_failed: bool,
     /// Servers from the inventory, workspaces and ~/.ssh/config.
     pub known_servers: Vec<crate::servers::Known>,
     /// ssh destinations already looked at for auto-adding.
@@ -870,6 +873,8 @@ pub fn run(session: &str) -> Result<()> {
         reload_generation: 0,
         config_scan: Default::default(),
         config_scan_again: false,
+        config_inputs: None,
+        config_scan_failed: false,
         known_servers: Vec::new(),
         discovered: Default::default(),
         accounts: crate::accounts::Accounts::empty(),
@@ -1580,8 +1585,9 @@ impl Server {
         if self.persist_dirty || due(now, self.last_persist, Duration::from_secs(30)) {
             self.persist_unless_writing();
         }
-        if due(now, self.last_def_scan, Duration::from_secs(5)) && self.config_scan.upgrade().is_none() {
-            self.scan_definitions_async();
+        if due(now, self.last_def_scan, Duration::from_secs(5)) {
+            self.last_def_scan = now;
+            self.check_definitions();
         }
     }
 
@@ -2122,6 +2128,8 @@ mod tests {
             reload_generation: 0,
             config_scan: Default::default(),
             config_scan_again: false,
+            config_inputs: None,
+            config_scan_failed: false,
             known_servers: Vec::new(),
             discovered: Default::default(),
             accounts: crate::accounts::Accounts::empty(),

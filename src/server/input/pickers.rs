@@ -531,6 +531,13 @@ impl Server {
     }
 
     pub(in crate::server) fn refresh_workspace_pickers(&mut self) {
+        self.refresh_workspace_pickers_from(None);
+    }
+
+    pub(in crate::server) fn refresh_workspace_pickers_from(
+        &mut self,
+        definitions: Option<&[(std::path::PathBuf, anyhow::Result<crate::workspace::WorkspaceDef>)]>,
+    ) {
         let clients: Vec<_> = self
             .clients
             .iter()
@@ -543,6 +550,8 @@ impl Server {
         for (id, ws, state) in clients {
             let mut picker = if state.kind == PickerKind::DeletedWorkspaces {
                 self.deleted_workspace_picker()
+            } else if let Some(definitions) = definitions {
+                self.workspace_picker_from(ws, definitions)
             } else {
                 self.workspace_picker(ws)
             };
@@ -559,9 +568,15 @@ impl Server {
     }
 
     pub(in crate::server) fn workspace_picker(&self, current: u32) -> Picker {
-        use crate::workspace::catalog::{Entry, Source, SourceData};
+        self.workspace_picker_from(current, &self.definitions())
+    }
 
-        let definitions = self.definitions();
+    fn workspace_picker_from(
+        &self,
+        current: u32,
+        definitions: &[(std::path::PathBuf, anyhow::Result<crate::workspace::WorkspaceDef>)],
+    ) -> Picker {
+        use crate::workspace::catalog::{Entry, Source, SourceData};
         let mut items = Vec::new();
         let mut catalog = self.workspace_catalog(definitions.iter().map(Source::loaded));
         catalog.sort_by_key(|entry| entry.position(&self.workspace_order));

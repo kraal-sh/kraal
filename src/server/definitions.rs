@@ -20,6 +20,49 @@ pub struct DefinitionSave {
     pub question: Option<String>,
 }
 
+pub(super) struct DefinitionScan {
+    directories: Vec<PathBuf>,
+    sources: Vec<(PathBuf, Option<(u64, u64)>)>,
+}
+
+pub(super) struct Definitions {
+    listed: Vec<(PathBuf, Result<WorkspaceDef>)>,
+    sources: Vec<(PathBuf, Result<workspace::ImportPreview>)>,
+}
+
+impl DefinitionScan {
+    pub(super) fn read(self, inputs: &mut super::config_scan::Inputs) -> Definitions {
+        inputs.workspace_paths(&self.directories, self.sources.iter().map(|(path, _)| path.clone()));
+        let mut listed = Vec::new();
+        for dir in self.directories {
+            inputs.workspace_directory(&dir);
+            listed.extend(workspace::load_dir(&dir));
+        }
+        let mut sources = Vec::new();
+        for (path, inode) in self.sources {
+            inputs.file(&path);
+            let moved = if paths::file_id(&path).is_none() {
+                inode.and_then(|id| listed.iter().map(|(p, _)| p).find(|p| paths::file_id(p) == Some(id)))
+            } else {
+                None
+            };
+            if let Some(moved) = moved {
+                inputs.file(moved);
+                sources.push((moved.clone(), workspace::ImportPreview::read(moved)));
+            }
+            sources.push((path.clone(), workspace::ImportPreview::read(&path)));
+        }
+        Definitions { listed, sources }
+    }
+}
+
+impl Definitions {
+    pub(super) fn failed(&self) -> bool {
+        self.listed.iter().any(|(_, d)| d.is_err())
+            || self.sources.iter().any(|(_, s)| s.as_ref().is_err_and(|e| !super::workspace_sources::source_missing(e)))
+    }
+}
+
 impl Server {
     pub(super) fn workspace_catalog<'a>(
         &'a self,
@@ -71,30 +114,31 @@ impl Server {
         }
     }
 
-    pub(super) fn scan_definitions(&mut self) {
-        let defs = self.scan_workspace_definitions();
-        self.refresh_known(&defs);
-        self.reload_accounts();
-    }
-
-    pub(super) fn scan_definitions_async(&mut self) {
-        let defs = self.scan_workspace_definitions();
-        self.scan_inventories(defs);
-    }
-
-    fn scan_workspace_definitions(&mut self) -> Vec<WorkspaceDef> {
+    pub(super) fn prepare_definition_scan(&mut self) -> DefinitionScan {
         self.last_def_scan = Instant::now();
-        // Their changes are told, and those of accounts.toml and of the accounts' usage,
-        // wherever they can be.
-        let mut dirs = self.config.workspace_dirs();
-        dirs.extend(self.workspaces.iter().filter_map(|w| w.definition.as_ref()?.parent().map(Path::to_path_buf)));
+        let directories = self.config.workspace_dirs();
+        let sources: Vec<_> =
+            self.workspaces.iter().filter_map(|w| Some((w.definition.clone()?, w.definition_inode))).collect();
+        let mut dirs = directories.clone();
+        dirs.extend(sources.iter().filter_map(|(p, _)| p.parent().map(Path::to_path_buf)));
         dirs.push(paths::config_dir());
         dirs.push(paths::state_dir().join("usage"));
         dirs.push(paths::state_dir().join("usage/by-id"));
         self.dirwatch.watch_config(&dirs);
-        let listed = self.definitions();
-        self.follow_definitions(&listed);
-        self.refresh_source_status();
+        DefinitionScan { directories, sources }
+    }
+
+    pub(super) fn apply_definition_scan(&mut self, scan: Definitions, reconcile: bool) -> Vec<WorkspaceDef> {
+        let mut listed = scan.listed;
+        let mut seen = HashSet::new();
+        listed.retain(|(path, _)| !self.source_removed(path) && seen.insert(path.clone()));
+        // A rename during the read needs a fresh listing before consuming the old inode.
+        if reconcile {
+            self.follow_definitions(&listed);
+            if self.apply_source_status(&scan.sources) {
+                self.refresh_workspace_pickers_from(Some(&listed));
+            }
+        }
         let files: Vec<(PathBuf, String)> =
             listed.iter().filter_map(|(p, d)| Some((p.clone(), d.as_ref().ok()?.name.clone()))).collect();
         if files != self.def_files {
