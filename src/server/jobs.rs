@@ -171,6 +171,7 @@ mod tests {
             let (id, _peer) = crate::server::tests::client(&mut server);
             let receive = server.clients.get_mut(&id).unwrap().out.capture();
             FAIL_START.set(fail);
+            let job = JobId(server.next_id);
             let started = server.background_owned(
                 ReplyHandle::new(id),
                 || "ready",
@@ -187,7 +188,7 @@ mod tests {
                 assert_eq!(response(&receive).unwrap_err(), "could not start");
             } else {
                 assert!(started.is_ok());
-                finish_job(&mut server, &rx);
+                finish_job(&mut server, &rx, job);
                 assert!(matches!(response(&receive), Ok(Response::Text(text)) if text == "ready"));
             }
             assert!(server.jobs.is_empty());
@@ -205,6 +206,7 @@ mod tests {
                 let mut server = server(tx);
                 let (id, _peer) = crate::server::tests::client(&mut server);
                 let receive = server.clients.get_mut(&id).unwrap().out.capture();
+                let job = JobId(server.next_id);
                 assert!(
                     server
                         .background_owned(
@@ -221,7 +223,7 @@ mod tests {
                 if disconnected {
                     server.drop_client(id);
                 }
-                finish_job(&mut server, &rx);
+                finish_job(&mut server, &rx, job);
                 assert!(server.jobs.is_empty());
                 let text = ["worker failed", "owned failure", "it panicked"][kind];
                 let error = format!("a background job failed: {text}");
@@ -243,20 +245,22 @@ mod tests {
         let mut server = server(tx);
         let (id, _peer) = crate::server::tests::client(&mut server);
         let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        let job = JobId(server.next_id);
         assert!(
             server
                 .background_owned(Some(ReplyHandle::new(id)), || panic!("failed"), |_, _, ()| panic!("not called"))
                 .is_ok()
         );
-        finish_job(&mut server, &rx);
+        finish_job(&mut server, &rx, job);
         assert!(server.jobs.is_empty());
         assert_eq!(server.warnings, ["a background job failed: failed"]);
         assert_eq!(response(&receive).unwrap_err(), "a background job failed: failed");
         assert!(!server.clients.contains_key(&id));
         assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
 
+        let job = JobId(server.next_id);
         assert!(server.background_owned(None, || panic!("no requester"), |_, _, ()| panic!("not called")).is_ok());
-        finish_job(&mut server, &rx);
+        finish_job(&mut server, &rx, job);
         assert!(server.jobs.is_empty());
         assert!(server.clients.is_empty());
         assert_eq!(server.warnings, ["a background job failed: failed", "a background job failed: no requester"]);

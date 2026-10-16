@@ -506,6 +506,7 @@ mod tests {
             let receive = server.clients.get_mut(&id).unwrap().out.capture();
             crate::server::jobs::FAIL_START.set(mode == "start failure");
             let params = if mode == "refused" { vec![("VALUE".into(), "no".into())] } else { vec![] };
+            let job = crate::server::jobs::JobId(server.next_id);
             let outcome = server.request(id, Request::RunbookPlan { path, target: None, params, pane: None });
             if mode == "start failure" {
                 let RequestOutcome::Immediate { reply, result } = outcome else { panic!("start failure") };
@@ -519,7 +520,7 @@ mod tests {
                     if mode == "disconnected" {
                         server.drop_client(id);
                     }
-                    finish_job(&mut server, &rx);
+                    finish_job(&mut server, &rx, job);
                 }
                 if mode == "refused" {
                     assert_eq!(response(&receive).unwrap_err(), "VALUE=no is not one of its choices: yes");
