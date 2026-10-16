@@ -25,6 +25,14 @@ devices are refused. Missing files still use defaults. Config reloads and automa
 and server inventory reads run in the background, so slow storage does not hold up terminal
 input while these files are read.
 
+Automatic scans check file metadata and directory listings on ticks at least five seconds
+apart, without opening or reading file contents on the server loop. Unchanged inputs do not
+start a background scan. Changes, pending scan requests and failed scans trigger another
+read; a change during a scan is checked again so it is not lost. Idle sessions keep their
+slower tick rate. This covers the configuration files, workspace definition directories and
+linked sources, and SSH host files and included directories when `ssh_config_hosts` is on.
+Changes to `config.toml` still need `kraal config reload` to apply settings.
+
 The check also reads your runbooks and, run in a repository, its `.kraal/worktree.toml` and its
 runbooks. A key kraal does not know in `config.toml`, `servers.toml` or `accounts.toml` (a typo,
 or a setting of another version of kraal) is a warning that names it, `bar.kyes: unknown key (did

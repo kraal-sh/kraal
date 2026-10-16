@@ -1,7 +1,7 @@
 //! SSH-side features of the server: the known servers, SSH panes, whole groups in a grid,
 //! discovered server suggestions, and the SSH picker.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -314,16 +314,25 @@ fn group_workspace_name(group: &str, remote: &[String]) -> String {
 
 /// Hosts from `~/.ssh/config` (no wildcards).
 pub fn ssh_config_hosts() -> Vec<String> {
-    let Some(home) = dirs::home_dir() else { return Vec::new() };
-    let mut out = Vec::new();
-    read_ssh_config(&home.join(".ssh/config"), &mut out, 0);
-    out.sort();
-    out.dedup();
-    out
+    ssh_config_hosts_observed(&mut |_, _| {}).0
 }
 
-fn read_ssh_config(path: &Path, out: &mut Vec<String>, depth: u8) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
+pub(super) fn ssh_config_hosts_observed(observe: &mut impl FnMut(&Path, bool)) -> (Vec<String>, bool) {
+    let Some(home) = dirs::home_dir() else { return (Vec::new(), false) };
+    let mut out = Vec::new();
+    let failed = read_ssh_config(&home.join(".ssh/config"), &mut out, 0, observe);
+    out.sort();
+    out.dedup();
+    (out, failed)
+}
+
+fn read_ssh_config(path: &Path, out: &mut Vec<String>, depth: u8, observe: &mut impl FnMut(&Path, bool)) -> bool {
+    observe(path, false);
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    let mut failed = false;
     for line in text.lines() {
         let line = line.trim();
         let mut parts = line.split_whitespace();
@@ -336,24 +345,58 @@ fn read_ssh_config(path: &Path, out: &mut Vec<String>, depth: u8) {
                 let p = if p.is_relative() { dirs::home_dir().unwrap_or_default().join(".ssh").join(p) } else { p };
                 // Support a trailing `*` glob, the common case (`Include config.d/*`).
                 if let Some(dir) = p.to_str().and_then(|s| s.strip_suffix("/*")) {
-                    if let Ok(rd) = std::fs::read_dir(dir) {
-                        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-                        files.sort();
-                        for f in files {
-                            read_ssh_config(&f, out, depth + 1);
+                    observe(Path::new(dir), true);
+                    let entries = match std::fs::read_dir(dir) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            failed |= e.kind() != std::io::ErrorKind::NotFound;
+                            continue;
+                        }
+                    };
+                    let mut files = Vec::new();
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => files.push(entry.path()),
+                            Err(_) => failed = true,
                         }
                     }
+                    files.sort();
+                    for f in files {
+                        failed |= read_ssh_config(&f, out, depth + 1, observe);
+                    }
                 } else {
-                    read_ssh_config(&p, out, depth + 1);
+                    failed |= read_ssh_config(&p, out, depth + 1, observe);
                 }
             }
         }
     }
+    failed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn include_traversal_failures_are_reported_but_missing_paths_are_optional() {
+        let dir = crate::testing::TempDir::new("ssh-includes");
+        let included = dir.write("included", "Host included\n");
+        let missing = dir.0.join("missing");
+        let config = dir.write("config", format!("Include {} {}/*\n", missing.display(), missing.display()));
+        let mut hosts = Vec::new();
+        assert!(!read_ssh_config(&config, &mut hosts, 0, &mut |_, _| {}));
+        assert!(hosts.is_empty());
+        assert!(!read_ssh_config(&missing, &mut hosts, 0, &mut |_, _| {}));
+        std::fs::write(&config, format!("Include {}/* {}\n", included.display(), included.display())).unwrap();
+        let mut directories = Vec::new();
+        assert!(read_ssh_config(&config, &mut hosts, 0, &mut |path, directory| {
+            if directory {
+                directories.push(path.to_path_buf());
+            }
+        }));
+        assert_eq!(directories, [included]);
+        assert_eq!(hosts, ["included"], "a failed include does not discard hosts from readable files");
+    }
 
     #[test]
     fn discovery_offers_a_form_without_a_write_or_a_connection() {
