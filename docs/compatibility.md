@@ -25,8 +25,8 @@ Current session files take precedence over old files. Kraal does not import, rew
 paths, so their saves and Forget cannot replace the current state or scrollback. Changes made
 in either format do not synchronize to the other.
 
-`kraal forget` removes current state and scrollback. If an old session remains, a later start
-refuses it with `run kraal 0.4 once first`. Forget creates no import marker.
+`kraal forget` removes current state, scrollback, attachments and saved paste buffers. If an old
+session remains, a later start refuses it with `run kraal 0.4 once first`. Forget creates no import marker.
 
 Account changes preserve comments, order and unknown keys without making a migration backup.
 Usage is read from identity-based caches in `usage/by-id`; old name-based caches are untouched.

@@ -1080,6 +1080,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_empty_workspace_identities_refuse_restore_without_changing_state() {
+        for id in [None, Some("")] {
+            let mut source = saved_state();
+            let workspace = source["workspaces"][0].as_object_mut().unwrap();
+            workspace.remove("id");
+            if let Some(id) = id {
+                workspace.insert("id".into(), id.into());
+            }
+            assert_state_refused(&serde_json::to_vec(&source).unwrap(), "invalid or duplicate workspace identity");
+        }
+    }
+
+    #[test]
     fn duplicate_workspace_and_layout_fields_refuse_restore_without_changing_state() {
         let source = saved_state();
         let ws = &source["workspaces"][0];

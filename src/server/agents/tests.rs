@@ -785,11 +785,11 @@ fn unrestored_accounts_follow_renames_but_never_replacements() {
     let old = t.server.accounts.get("claude", "from").unwrap();
     let pane = serde_json::json!({ "name": "agent", "agent": "claude", "agent_session": null,
             "spec": { "account": "claude:from", "env": [["CLAUDE_CONFIG_DIR", old.home]] } });
-    let ws = serde_json::json!({ "name": "failed", "definition": null, "cwd": null, "active": 0,
+    let ws = serde_json::json!({ "id": "failed", "name": "failed", "definition": null, "cwd": null, "active": 0,
             "tabs": [{ "name": "", "root": { "Split": { "axis": "Row", "children": [[{ "Pane": pane }, 1.0]] } },
                 "floating": [[pane, { "x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5 }]],
                 "focus": null, "show_floating": true, "zoomed": false, "sync": false }] });
-    let ws: crate::persist::WorkspaceSnap = serde_json::from_value(ws).unwrap();
+    let mut ws: crate::persist::WorkspaceSnap = serde_json::from_value(ws).unwrap();
     t.server.env.shell = t.dir.join("missing-shell").display().to_string();
     crate::server::persistence::apply(
         &mut t.server,
@@ -804,12 +804,14 @@ fn unrestored_accounts_follow_renames_but_never_replacements() {
     )
     .unwrap();
     assert_eq!(t.server.unrestored.len(), 1, "the missing shell prevents restoration");
+    assert_eq!(t.server.unrestored[0].id, ws.id);
     assert_eq!(
         t.server.unrestored[0].tabs[0].floating[0].0.spec.account_id.as_deref(),
         Some(old.id.as_str()),
         "even panes not reached by restore must already be bound"
     );
     // A legacy workspace retained before a reload is bound too.
+    ws.id = "retained".into();
     t.server.unrestored.push(ws);
     t.server.follow_renamed_accounts();
     t.server.accounts.remove("claude", "from");
