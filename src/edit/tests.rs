@@ -95,13 +95,14 @@ fn a_new_version_replaces_the_file_with_its_mode() {
     let meta = std::fs::metadata(&file).unwrap();
     assert_eq!(meta.permissions().mode() & 0o7777, 0o640, "the mode is kept");
     assert_ne!(meta.ino(), before, "a new file was renamed over the old one");
-    assert!(Here::leftovers(&t.home()).is_empty());
+    assert_remote_previous(&t.home(), "app.conf", &[b"hello\n"]);
     // What the save says identifies the new version, as a new read does.
     let again = t.open("~/app.conf").unwrap();
     assert_eq!(saved, Saved::Written(again.identity.clone()));
     // An empty new version is a version too.
     assert!(matches!(t.save(&again, &again.identity, b"").unwrap(), Saved::Written(_)));
     assert_eq!(std::fs::read(&file).unwrap(), b"");
+    assert_remote_previous(&t.home(), "app.conf", &[b"hello\n", b"hello\nmore\n"]);
 }
 
 #[test]
@@ -126,6 +127,242 @@ fn a_file_changed_on_the_server_is_never_overwritten() {
     let err = t.save(&opened, &now, b"again\n").unwrap_err().to_string();
     assert!(err.contains("removed"), "{err}");
     assert!(!file.exists());
+}
+
+#[test]
+fn a_remote_save_between_the_check_and_move_is_restored() {
+    for rename in [false, true] {
+        let t = Here::new(&format!("before-move-{rename}"));
+        let file = t.home().join("f.txt");
+        std::fs::write(&file, "first").unwrap();
+        let opened = t.open("f.txt").unwrap();
+        let save = if rename {
+            "printf concurrent > replacement; /bin/mv replacement f.txt"
+        } else {
+            "printf concurrent > f.txt"
+        };
+        crate::testing::write_script(&t.dir.join("bin/mv"), &format!("#!/bin/sh\n{save}\nexec /bin/mv \"$@\"\n"));
+        let saved = t.save(&opened, &opened.identity, b"mine").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"concurrent");
+        assert_eq!(saved, Saved::Changed(t.open("f.txt").unwrap().identity));
+        assert!(Here::leftovers(&t.home()).is_empty());
+    }
+}
+
+fn remote_recovery(t: &Here, err: &str) -> PathBuf {
+    let leftovers = Here::leftovers(&t.home());
+    assert_eq!(leftovers.len(), 1, "{leftovers:?}: {err}");
+    assert!(err.contains("recovery copies") && err.contains(&leftovers[0]), "{err}");
+    t.home().join(&leftovers[0])
+}
+
+/// Successful saves keep only the old files, with no locks or staged new versions.
+fn assert_remote_previous(dir: &Path, name: &str, expected: &[&[u8]]) {
+    let leftovers = Here::leftovers(dir);
+    assert_eq!(leftovers.len(), expected.len(), "{leftovers:?}");
+    let mut contents = Vec::new();
+    for entry in leftovers {
+        assert!(!entry.starts_with(".kraal-edit-lock-"));
+        let recovery = dir.join(entry);
+        assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(recovery.join("old")).unwrap().count(), 1);
+        contents.push(std::fs::read(recovery.join("old").join(name)).unwrap());
+    }
+    contents.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(contents, expected);
+}
+
+#[test]
+fn a_remote_entry_appearing_before_publication_is_left_alone() {
+    for kind in ["file", "directory", "link", "dangling"] {
+        let t = Here::new(&format!("before-link-{kind}"));
+        let file = t.home().join("f.txt");
+        std::fs::write(&file, "first").unwrap();
+        std::fs::create_dir(t.home().join("target")).unwrap();
+        let opened = t.open("f.txt").unwrap();
+        let create = match kind {
+            "file" => "printf concurrent > f.txt",
+            "directory" => "mkdir f.txt",
+            "link" => "/bin/ln -s target f.txt",
+            _ => "/bin/ln -s missing f.txt",
+        };
+        crate::testing::write_script(
+            &t.dir.join("bin/ln"),
+            &format!("#!/bin/sh\ncase $2:$3 in */new/*:./) {create} ;; esac\nexec /bin/ln \"$@\"\n"),
+        );
+        let err = t.save(&opened, &opened.identity, b"mine").unwrap_err().to_string();
+        let recovery = remote_recovery(&t, &err);
+        assert_eq!(std::fs::read(recovery.join("old/f.txt")).unwrap(), b"first");
+        assert_eq!(std::fs::read(recovery.join("new/f.txt")).unwrap(), b"mine");
+        match kind {
+            "file" => assert_eq!(std::fs::read(&file).unwrap(), b"concurrent"),
+            "directory" => assert_eq!(std::fs::read_dir(&file).unwrap().count(), 0),
+            _ => assert_eq!(
+                std::fs::read_link(&file).unwrap(),
+                Path::new(if kind == "link" { "target" } else { "missing" })
+            ),
+        }
+        assert_eq!(std::fs::read_dir(t.home().join("target")).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn remote_restoration_does_not_replace_a_second_save() {
+    let t = Here::new("restore-race");
+    let file = t.home().join("f.txt");
+    std::fs::write(&file, "first").unwrap();
+    let opened = t.open("f.txt").unwrap();
+    crate::testing::write_script(&t.dir.join("bin/mv"), "#!/bin/sh\nprintf concurrent > f.txt\nexec /bin/mv \"$@\"\n");
+    crate::testing::write_script(
+        &t.dir.join("bin/ln"),
+        "#!/bin/sh\ncase $2:$3 in */old/*:./) printf 'another save' > f.txt ;; esac\nexec /bin/ln \"$@\"\n",
+    );
+    let err = t.save(&opened, &opened.identity, b"mine").unwrap_err().to_string();
+    let recovery = remote_recovery(&t, &err);
+    assert_eq!(std::fs::read(&file).unwrap(), b"another save");
+    assert_eq!(std::fs::read(recovery.join("old/f.txt")).unwrap(), b"concurrent");
+    assert_eq!(std::fs::read(recovery.join("new/f.txt")).unwrap(), b"mine");
+}
+
+#[test]
+fn a_remote_write_to_the_moved_inode_is_kept() {
+    let t = Here::new("moved-inode");
+    let file = t.home().join("f.txt");
+    std::fs::write(&file, "first").unwrap();
+    let opened = t.open("f.txt").unwrap();
+    crate::testing::write_script(
+        &t.dir.join("bin/ln"),
+        "#!/bin/sh\ncase $2:$3 in */new/*:./) for old in .kraal-edit-*/old/f.txt; do printf concurrent > \"$old\"; done ;; esac\nexec /bin/ln \"$@\"\n",
+    );
+    let err = t.save(&opened, &opened.identity, b"mine").unwrap_err().to_string();
+    let recovery = remote_recovery(&t, &err);
+    assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+    assert_eq!(std::fs::read(recovery.join("old/f.txt")).unwrap(), b"concurrent");
+}
+
+#[test]
+fn a_remote_failure_after_moving_restores_the_original() {
+    let t = Here::new("move-failure");
+    let file = t.home().join("f.txt");
+    std::fs::write(&file, "first").unwrap();
+    let opened = t.open("f.txt").unwrap();
+    crate::testing::write_script(&t.dir.join("bin/mv"), "#!/bin/sh\n/bin/mv \"$@\"\nexit 1\n");
+    assert!(t.save(&opened, &opened.identity, b"mine").is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"first");
+    assert!(Here::leftovers(&t.home()).is_empty());
+}
+
+#[test]
+fn a_remote_write_after_the_final_check_survives_cleanup() {
+    let t = Here::new("after-final-check");
+    let file = t.home().join("f.txt");
+    std::fs::write(&file, "first").unwrap();
+    let opened = t.open("f.txt").unwrap();
+    let inode = std::fs::metadata(&file).unwrap().ino();
+    // Hold the original open before the move. Releasing the lock is after the final check,
+    // before the EXIT cleanup. The descriptor closes when the save process exits.
+    let ssh = std::fs::read_to_string(&t.ssh).unwrap();
+    crate::testing::write_script(
+        Path::new(&t.ssh),
+        &ssh.replace(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\nexec 9>> {}\n", crate::shell::quote(&file.display().to_string())),
+        ),
+    );
+    crate::testing::write_script(
+        &t.dir.join("bin/rmdir"),
+        "#!/bin/sh\nprintf ' concurrent' >&9\nexec /bin/rmdir \"$@\"\n",
+    );
+    assert!(matches!(t.save(&opened, &opened.identity, b"mine").unwrap(), Saved::Written(_)));
+    assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+    assert_remote_previous(&t.home(), "f.txt", &[b"first concurrent"]);
+    let recovery = t.home().join(&Here::leftovers(&t.home())[0]).join("old/f.txt");
+    assert_eq!(std::fs::metadata(recovery).unwrap().ino(), inode);
+}
+
+#[test]
+fn unsupported_remote_links_are_refused_before_moving_the_file() {
+    for failure in ["all", "original", "symlink", "following"] {
+        let t = Here::new(&format!("unsupported-links-{failure}"));
+        let file = t.home().join("f.txt");
+        std::fs::write(&file, "first").unwrap();
+        let opened = t.open("f.txt").unwrap();
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        let reject = match failure {
+            "all" => "exit 1",
+            "original" => "[ \"$2\" != ./f.txt ] || exit 1",
+            "following" => "[ \"$1\" != -P ] || exit 1; exec /bin/ln -L \"$@\"",
+            _ => "[ \"$1\" != -s ] || exit 1",
+        };
+        crate::testing::write_script(&t.dir.join("bin/ln"), &format!("#!/bin/sh\n{reject}\nexec /bin/ln \"$@\"\n"));
+        crate::testing::write_script(&t.dir.join("bin/mv"), "#!/bin/sh\ntouch moved\nexec /bin/mv \"$@\"\n");
+        let err = t.save(&opened, &opened.identity, b"mine").unwrap_err().to_string();
+        assert!(err.contains("hard links") && err.contains("left as it was"), "{err}");
+        assert!(!t.home().join("moved").exists());
+        assert_eq!(std::fs::read(&file).unwrap(), b"first");
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), inode);
+        assert!(Here::leftovers(&t.home()).is_empty());
+    }
+}
+
+#[test]
+fn remote_saves_preserve_symlinks_when_ln_follows_them_by_default() {
+    for link in [None, Some("target"), Some("missing")] {
+        let t = Here::new(&format!("following-links-{}", link.unwrap_or("save")));
+        let file = t.home().join("f.txt");
+        std::fs::write(&file, "first").unwrap();
+        std::fs::write(t.home().join("target"), "untouched").unwrap();
+        let opened = t.open("f.txt").unwrap();
+        // macOS follows source symlinks unless -P is given, unlike GNU ln and BusyBox.
+        crate::testing::write_script(&t.dir.join("bin/ln"), "#!/bin/sh\nexec /bin/ln -L \"$@\"\n");
+        if let Some(target) = link {
+            crate::testing::write_script(
+                &t.dir.join("bin/mv"),
+                &format!("#!/bin/sh\nrm f.txt; /bin/ln -s {target} f.txt\nexec /bin/mv \"$@\"\n"),
+            );
+        }
+        let result = t.save(&opened, &opened.identity, b"mine");
+        if let Some(target) = link {
+            assert!(result.unwrap_err().to_string().contains("not a regular file"));
+            assert_eq!(std::fs::read_link(&file).unwrap(), Path::new(target));
+            assert!(Here::leftovers(&t.home()).is_empty());
+        } else {
+            assert_eq!(result.unwrap(), Saved::Written(t.open("f.txt").unwrap().identity));
+            assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+            assert_remote_previous(&t.home(), "f.txt", &[b"first"]);
+        }
+        assert_eq!(std::fs::read(t.home().join("target")).unwrap(), b"untouched");
+        assert!(!t.home().join("missing").exists());
+    }
+}
+
+#[test]
+fn remote_restoration_works_without_ln_uppercase_p() {
+    for symlink in [false, true] {
+        let t = Here::new(&format!("busybox-restore-{symlink}"));
+        let file = t.home().join("f.txt");
+        std::fs::write(&file, "first").unwrap();
+        let opened = t.open("f.txt").unwrap();
+        // Reject -P as BusyBox does, but preserve source symlinks even on a macOS host.
+        crate::testing::write_script(
+            &t.dir.join("bin/ln"),
+            "#!/bin/sh\nfor a; do [ \"$a\" != -P ] || { echo 'invalid option: P' >&2; exit 1; }; done\nexec /bin/ln -P \"$@\"\n",
+        );
+        let change = if symlink { "rm f.txt; /bin/ln -s missing f.txt" } else { "printf concurrent > f.txt" };
+        crate::testing::write_script(&t.dir.join("bin/mv"), &format!("#!/bin/sh\n{change}\nexec /bin/mv \"$@\"\n"));
+        let result = t.save(&opened, &opened.identity, b"mine");
+        if symlink {
+            assert!(result.unwrap_err().to_string().contains("not a regular file"));
+            assert_eq!(std::fs::read_link(&file).unwrap(), Path::new("missing"));
+            assert!(!t.home().join("missing").exists());
+        } else {
+            assert_eq!(result.unwrap(), Saved::Changed(t.open("f.txt").unwrap().identity));
+            assert_eq!(std::fs::read(&file).unwrap(), b"concurrent");
+        }
+        assert!(Here::leftovers(&t.home()).is_empty());
+    }
 }
 
 #[test]
@@ -156,7 +393,11 @@ fn odd_names_reach_the_shell_as_they_are() {
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited\n", "{name:?}");
             std::fs::write(&file, format!("{name}\n")).unwrap();
         }
-        assert!(Here::leftovers(&dir).is_empty());
+        let contents = format!("{name}\n");
+        assert_remote_previous(&dir, name, &[contents.as_bytes(), contents.as_bytes()]);
+        for recovery in Here::leftovers(&dir) {
+            std::fs::remove_dir_all(dir.join(recovery)).unwrap();
+        }
     }
     let pwned: Vec<_> = walk(&t.dir).into_iter().filter(|p| p.to_string_lossy().contains("pwned")).collect();
     assert!(pwned.iter().all(|p| p.to_string_lossy().contains("$(touch pwned)")), "{pwned:?}");
@@ -410,7 +651,7 @@ fn two_saves_of_the_same_version_never_both_win() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(matches!(parse_saved(&out.stdout).unwrap(), Saved::Changed(_)), "the slow save overwrote the other one");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "fast\n");
-    assert!(Here::leftovers(&t.home()).is_empty());
+    assert_remote_previous(&t.home(), "shared.txt", &[b"v1\n"]);
 }
 
 /// A save waits while another kraal holds the file's lock, then goes on.
@@ -434,7 +675,7 @@ fn a_save_waits_for_the_lock_of_another() {
     assert!(start.elapsed() >= Duration::from_millis(500), "it did not wait");
     release.join().unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2\n");
-    assert!(Here::leftovers(&t.home()).is_empty());
+    assert_remote_previous(&t.home(), "f.txt", &[b"v1\n"]);
 }
 
 /// A lock another save let go of between the time this one failed to make it and the time it
@@ -465,7 +706,7 @@ fn a_save_takes_a_lock_let_go_of_while_it_looked() {
     let err = t.save(&opened, &identity, b"v3\n").unwrap_err();
     assert!(format!("{err:#}").contains("no lock can be made next to it"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2\n");
-    assert!(Here::leftovers(&t.home()).is_empty());
+    assert_remote_previous(&t.home(), "f.txt", &[b"v1\n"]);
 }
 
 /// The server's version is written over the editor's copy only while the copy is as it was when
@@ -477,6 +718,7 @@ fn the_servers_version_never_replaces_a_copy_saved_meanwhile() {
     let seen = stamp(&local);
     let now = replace_copy(&local, seen, b"theirs\n").unwrap();
     assert!(now.is_some());
+    assert_eq!(now, stamp(&local));
     assert_eq!(std::fs::read_to_string(&local).unwrap(), "theirs\n");
     std::thread::sleep(Duration::from_millis(20));
     std::fs::write(&local, "mine again\n").unwrap();
@@ -488,6 +730,156 @@ fn the_servers_version_never_replaces_a_copy_saved_meanwhile() {
     let (_, local) = local_copy(&t.dir.join("edit"), ".kraal-new", b"mine\n").unwrap();
     assert!(replace_copy(&local, stamp(&local), b"theirs\n").unwrap().is_some());
     assert_eq!(std::fs::read_to_string(&local).unwrap(), "theirs\n");
+}
+
+#[test]
+fn a_local_save_between_the_check_and_move_is_restored() {
+    for rename in [false, true] {
+        let t = Here::new(&format!("local-before-move-{rename}"));
+        let base = t.dir.join("edit");
+        let (dir, local) = local_copy(&base, "f.txt", b"first").unwrap();
+        let result = replace_copy_with(
+            &local,
+            stamp(&local),
+            b"theirs",
+            || {
+                if rename {
+                    let replacement = dir.join("replacement");
+                    std::fs::write(&replacement, b"concurrent").unwrap();
+                    std::fs::rename(replacement, &local).unwrap();
+                } else {
+                    std::fs::write(&local, b"concurrent").unwrap();
+                }
+            },
+            || panic!("a changed original must not be replaced"),
+            || {},
+        );
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(std::fs::read(&local).unwrap(), b"concurrent");
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn local_publication_and_restoration_leave_a_new_entry_alone() {
+    for kind in ["file", "directory", "link", "dangling"] {
+        let t = Here::new(&format!("local-before-install-{kind}"));
+        let base = t.dir.join("edit");
+        let (dir, local) = local_copy(&base, "f.txt", b"first").unwrap();
+        let target = t.dir.join("target");
+        std::fs::write(&target, b"target").unwrap();
+        let err = replace_copy_with(
+            &local,
+            stamp(&local),
+            b"theirs",
+            || {},
+            || match kind {
+                "file" => std::fs::write(&local, b"concurrent").unwrap(),
+                "directory" => std::fs::create_dir(&local).unwrap(),
+                _ => std::os::unix::fs::symlink(
+                    if kind == "link" { target.clone() } else { t.dir.join("missing") },
+                    &local,
+                )
+                .unwrap(),
+            },
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        let recovery = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().path()).find(|p| p != &dir).unwrap();
+        assert!(err.contains(&recovery.display().to_string()), "{err}");
+        assert_eq!(std::fs::read(recovery.join("previous")).unwrap(), b"first");
+        assert_eq!(std::fs::read(recovery.join("new")).unwrap(), b"theirs");
+        match kind {
+            "file" => assert_eq!(std::fs::read(&local).unwrap(), b"concurrent"),
+            "directory" => assert_eq!(std::fs::read_dir(&local).unwrap().count(), 0),
+            _ => assert!(local.is_symlink()),
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        // Finishing the edit removes only its own directory.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(std::fs::read(recovery.join("previous")).unwrap(), b"first");
+        assert_eq!(std::fs::read(recovery.join("new")).unwrap(), b"theirs");
+    }
+}
+
+#[test]
+fn a_local_write_to_the_moved_inode_is_kept() {
+    let t = Here::new("local-moved-inode");
+    let base = t.dir.join("edit");
+    let (dir, local) = local_copy(&base, "f.txt", b"first").unwrap();
+    let mut writer = std::fs::OpenOptions::new().append(true).open(&local).unwrap();
+    let err =
+        replace_copy_with(&local, stamp(&local), b"theirs", || {}, || writer.write_all(b" concurrent").unwrap(), || {})
+            .unwrap_err()
+            .to_string();
+    let recovery = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().path()).find(|p| p != &dir).unwrap();
+    assert!(err.contains(&recovery.display().to_string()), "{err}");
+    assert_eq!(std::fs::read(&local).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(recovery.join("previous")).unwrap(), b"first concurrent");
+}
+
+#[test]
+fn a_local_write_after_the_final_check_survives_cleanup() {
+    let t = Here::new("local-after-final-check");
+    let base = t.dir.join("edit");
+    let (dir, local) = local_copy(&base, "f.txt", b"first").unwrap();
+    let mut writer = std::fs::OpenOptions::new().append(true).open(&local).unwrap();
+    let inode = writer.metadata().unwrap().ino();
+    let result =
+        replace_copy_with(&local, stamp(&local), b"theirs", || {}, || {}, || writer.write_all(b" concurrent").unwrap())
+            .unwrap();
+    assert_eq!(result, stamp(&local));
+    assert!(result.is_some());
+    assert_eq!(std::fs::read(&local).unwrap(), b"theirs");
+    let recovery = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().path()).find(|p| p != &dir).unwrap();
+    assert_eq!(std::fs::metadata(recovery.join("previous")).unwrap().ino(), inode);
+    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 1);
+    // Both closing the editor and writing again through its descriptor leave a recovery copy.
+    std::fs::remove_dir_all(&dir).unwrap();
+    writer.write_all(b" later").unwrap();
+    drop(writer);
+    assert_eq!(std::fs::read(recovery.join("previous")).unwrap(), b"first concurrent later");
+}
+
+#[test]
+fn a_link_moved_instead_of_the_local_copy_is_restored() {
+    let t = Here::new("local-moved-link");
+    let base = t.dir.join("edit");
+    let (dir, local) = local_copy(&base, "f.txt", b"first").unwrap();
+    let target = dir.join("target");
+    std::fs::write(&target, b"target").unwrap();
+    let result = replace_copy_with(
+        &local,
+        stamp(&local),
+        b"theirs",
+        || {
+            std::fs::remove_file(&local).unwrap();
+            std::os::unix::fs::symlink(&target, &local).unwrap();
+        },
+        || panic!("a link must not be replaced"),
+        || {},
+    );
+    assert_eq!(result.unwrap(), None);
+    assert_eq!(std::fs::read_link(&local).unwrap(), target);
+    assert_eq!(replace_copy(&local, stamp(&local), b"theirs").unwrap(), None);
+    assert_eq!(std::fs::read(&target).unwrap(), b"target");
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+}
+
+#[test]
+fn a_missing_local_copy_is_not_recreated_by_reload() {
+    let t = Here::new("local-missing");
+    let (dir, local) = local_copy(&t.dir.join("edit"), "f.txt", b"first").unwrap();
+    let seen = stamp(&local);
+    std::fs::remove_file(&local).unwrap();
+    assert_eq!(replace_copy(&local, seen, b"theirs").unwrap(), None);
+    assert_eq!(replace_copy(&local, None, b"theirs").unwrap(), None);
+    std::fs::write(&local, b"concurrent").unwrap();
+    assert_eq!(replace_copy(&local, None, b"theirs").unwrap(), None);
+    assert_eq!(std::fs::read(&local).unwrap(), b"concurrent");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 }
 
 /// Through sudo: the password is handed over once, wiped, and every read and save of the edit
@@ -543,7 +935,7 @@ fn as_root_through_sudo_the_password_is_given_once() {
     assert!(s.open("/nowhere/x").is_err());
     assert!(matches!(s.save(&again.file, &again.identity, b"").unwrap(), Saved::Written(_)));
     assert_eq!(std::fs::read(&file).unwrap(), b"");
-    assert!(Here::leftovers(&etc).is_empty());
+    assert_remote_previous(&etc, "app.conf", &[b"a\n", &content]);
     drop(s);
 
     // A wrong password: refused.

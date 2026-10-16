@@ -635,7 +635,7 @@ impl Server {
             Answer::KeepServer => {
                 e.conflict = None;
                 e.busy = true;
-                // The copy as it is now: a save made after this answer is never overwritten.
+                // The answer applies to this version; replacement checks the entry moved aside.
                 let answered = edit::stamp(&local);
                 let path = file.path();
                 self.background(

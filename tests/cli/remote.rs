@@ -1081,6 +1081,32 @@ fn a_tab_attached_to_a_server_shows_each_agent_there_in_turn() {
     assert_eq!(panes.as_array().unwrap().len(), 2, "no other tab attached: {panes}");
 }
 
+/// Successful saves retain only the previous versions, with no locks or staged new files.
+#[cfg(target_os = "linux")]
+fn assert_remote_previous(dir: &Path, name: &str, expected: &[&[u8]]) {
+    let entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+    assert_eq!(entries.len(), expected.len() + 1, "only the file and its previous versions remain");
+    let mut contents = Vec::new();
+    for entry in entries {
+        if entry.file_name() == name {
+            assert!(entry.file_type().unwrap().is_file());
+            continue;
+        }
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        assert!(filename.starts_with(".kraal-edit-") && !filename.starts_with(".kraal-edit-lock-"), "{filename}");
+        assert!(entry.file_type().unwrap().is_dir());
+        let recovery = entry.path();
+        assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 1, "only the old version is retained");
+        assert_eq!(std::fs::read_dir(recovery.join("old")).unwrap().count(), 1);
+        contents.push(std::fs::read(recovery.join("old").join(name)).unwrap());
+    }
+    contents.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(contents, expected);
+}
+
 /// A file of a server opens in the local editor, each save goes back to the server (its mode
 /// kept), a change made on the server meanwhile is never overwritten unasked, and each answer
 /// does what it says. The server is a real sshd; the editor is a script told what to do.
@@ -1179,9 +1205,7 @@ fn a_server_file_is_edited_in_the_local_editor() {
     step(1, "printf 'more\\n' >> \"$f\"");
     wait_until("the second save reaches the server", &|| read(&notes) == "hello\nadded\nmore\n");
     quit(&local);
-    let names: Vec<String> =
-        std::fs::read_dir(&srv).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-    assert_eq!(names, vec!["notes 'q' $HOME;.conf".to_string()], "nothing else is left there");
+    assert_remote_previous(&srv, "notes 'q' $HOME;.conf", &[b"hello\n", b"hello\nadded\n"]);
     assert!(!env.root.join("srv/pwned").exists());
 
     // Changed on the server meanwhile: nothing is sent; kept as a local file, later saves go there.
@@ -1328,9 +1352,7 @@ fn a_server_file_is_edited_as_root_through_sudo() {
     b.step(1, "printf 'v3\\n' > \"$f\"");
     b.wait_until("the next save, through the same sudo", &|| read(&file) == "v3\n");
     b.quit(&local);
-    let names: Vec<String> =
-        std::fs::read_dir(&b.srv).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-    assert_eq!(names, vec!["sudo".to_string()], "no temporary file or lock is left");
+    assert_remote_previous(&b.srv, "sudo", &[b"v1\n", b"v2\n"]);
 
     // A wrong password: refused, nothing opens.
     let cli = b.kraal(&["edit", "--sudo", &target]).stdout(piped()).stderr(piped()).spawn().unwrap();

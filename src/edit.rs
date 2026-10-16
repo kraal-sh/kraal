@@ -4,11 +4,11 @@
 //! (`server::edits`).
 //!
 //! Nothing is written blindly: the server's version is identified by a hash made there when it
-//! is read, and a new version replaces it only while that hash is still the same. A new version
-//! is written next to the file, then renamed over it, with the file's mode (and owner, when the
-//! user may give it): an interrupted save leaves the old file whole. Once the new version has
-//! arrived, the check and the rename happen under a lock next to the file, so two kraal editors
-//! of the same file never overwrite each other unseen.
+//! is read. A save keeps the entry it moves aside and checks that version before publishing
+//! the new one without replacing a name taken meanwhile. An interrupted save restores the
+//! previous entry where possible, otherwise it keeps a recovery directory and reports it.
+//! The new file keeps the mode (and owner, when the user may give it). A lock next to the file
+//! serializes kraal saves; other editors need not honor that lock.
 //!
 //! A file the user may not write is edited as root on request (`kraal edit --sudo`): one ssh
 //! connection runs sudo for the whole edit, sudo reads the password kraal is handed once (typed
@@ -149,7 +149,7 @@ fn open_function(as_root: bool) -> String {
 
 /// What writes the bytes `receive` prints as the new version of `$sn` in `$sd`, in a subshell, if
 /// the file is still the one `$se` identifies and the bytes are `$sl` long: a new file next to
-/// it, with its mode (and owner when allowed), renamed over it. The new version arrives first;
+/// it, with its mode (and owner when allowed), linked into place. The new version arrives first;
 /// then, holding a lock that other kraal saves of the same file wait for, the file is checked
 /// again and replaced. Prints [`SAVED`] and the new identity, or [`CHANGED`] and the identity
 /// of what is there now.
@@ -163,14 +163,24 @@ fn save_function() -> String {
         "h=$(k \"$n\") || exit 3",
         // Changed already: nothing to send.
         "if [ \"$h\" != \"$se\" ]; then printf 'KRAAL:CHANGED\\0%s\\0' \"$h\"; exit 0; fi",
-        "t=$(mktemp ./.kraal-edit-XXXXXX) || exit 3",
+        "t=$(mktemp -d ./.kraal-edit-XXXXXX) || exit 3",
         "l=",
-        "trap '[ -z \"$t\" ] || rm -f -- \"$t\"; [ -z \"$l\" ] || rmdir -- \"$l\"' EXIT",
+        "b=",
+        "p=-P",
+        // Give ln the destination directory: the source's basename is used once, so even a
+        // directory or a symlink appearing at $n makes link(2) fail.
+        "cleanup() { r=$?; \
+         if [ -n \"$b\" ] && { [ -e \"$b/$n\" ] || [ -L \"$b/$n\" ]; }; then \
+         if ! ln \"$p\" \"$b/$n\" ./ 2>/dev/null; then \
+         echo \"the file changed or could not be restored; recovery copies are in $sd/${t#./}\" >&2; t=; r=3; fi; fi; \
+         [ -z \"$t\" ] || rm -rf -- \"$t\"; [ -z \"$l\" ] || rmdir -- \"$l\"; exit \"$r\"; }",
+        "trap cleanup EXIT",
         "trap 'exit 1' HUP INT TERM",
+        "mkdir -- \"$t/new\" \"$t/old\" || exit 3",
         // A copy first, for the mode, owner, group and ACLs; then the new content in it.
-        "cp -p -- \"$n\" \"$t\" || exit 3",
-        "receive > \"$t\" || exit 3",
-        "s=$(wc -c < \"$t\") || exit 3",
+        "cp -p -- \"$n\" \"$t/new/$n\" || exit 3",
+        "receive > \"$t/new/$n\" || exit 3",
+        "s=$(wc -c < \"$t/new/$n\") || exit 3",
         "set -- $s",
         "if [ \"$1\" != \"$sl\" ]; then echo 'the new version did not arrive whole: the file was left as it was' >&2; exit 3; fi",
         "set -- $(printf %s \"$n\" | cksum)",
@@ -193,12 +203,34 @@ fn save_function() -> String {
         "if [ -L \"$n\" ] || [ ! -f \"$n\" ]; then gone; fi",
         "h=$(k \"$n\") || exit 3",
         "if [ \"$h\" != \"$se\" ]; then printf 'KRAAL:CHANGED\\0%s\\0' \"$h\"; exit 0; fi",
-        "h=$(k \"$t\") || exit 3",
-        "mv -f -- \"$t\" \"$n\" || exit 3",
+        "v=$(k \"$t/new/$n\") || exit 3",
+        // macOS needs -P to preserve source symlinks; BusyBox has no -P but preserves them by
+        // default. Probe that behavior and both files before moving anything. Every hard-link
+        // source starts with ./, so the option can be either -P or --.
+        "mkdir -- \"$t/probe\" \"$t/probe/new\" \"$t/probe/old\" || exit 3",
+        "if ! ln -s -- missing \"$t/probe/link\" || \
+         ! { ln \"$p\" \"$t/probe/link\" \"$t/\" 2>/dev/null || { p=--; ln \"$p\" \"$t/probe/link\" \"$t/\"; }; } || \
+         [ ! -L \"$t/link\" ] || \
+         ! ln \"$p\" \"$t/new/$n\" \"$t/probe/new/\" || \
+         ! ln \"$p\" \"./$n\" \"$t/probe/old/\"; then \
+         echo 'hard links preserving symbolic links are required: the file was left as it was' >&2; exit 3; fi",
+        "rm -rf -- \"$t/probe\" \"$t/link\" || exit 3",
+        "b=$t/old",
+        "mv -- \"$n\" \"$b/$n\" || exit 3",
+        "if [ -L \"$b/$n\" ] || [ ! -f \"$b/$n\" ]; then gone; fi",
+        "h=$(k \"$b/$n\") || exit 3",
+        "if [ \"$h\" != \"$se\" ]; then printf 'KRAAL:CHANGED\\0%s\\0' \"$h\"; exit 0; fi",
+        "ln \"$p\" \"$t/new/$n\" ./ || exit 3",
+        // A writer may still hold the moved inode open while the new entry is published.
+        "h=$(k \"$b/$n\") || exit 3",
+        "if [ \"$h\" != \"$se\" ]; then exit 3; fi",
+        // No final check can rule out a later write through an open descriptor.
+        "rm -rf -- \"$t/new\" || exit 3",
+        "b=",
         "t=",
         "rmdir -- \"$l\"",
         "l=",
-        "printf 'KRAAL:SAVED\\0%s\\0' \"$h\"",
+        "printf 'KRAAL:SAVED\\0%s\\0' \"$v\"",
         ")",
     ];
     lines.join("\n")
@@ -797,21 +829,63 @@ pub fn local_copy(base: &Path, name: &str, content: &[u8]) -> std::io::Result<(P
     }
 }
 
-/// Write `content` over the editor's copy `local` (the server's version, say) unless the copy
-/// is no longer as `seen`: a save made meanwhile is never overwritten. The copy is replaced by a
-/// rename; its new stamp, or `None` when it had changed.
+/// Replace the editor's copy `local` only if the entry moved aside is still as `seen`.
+/// Returns the new stamp, or `None` after a change that could be left in place or restored.
+/// The moved inode stays in a sibling directory even after success, for writers still holding
+/// it open. If restoration would replace a new entry, an error names the recovery directory.
 pub fn replace_copy(local: &Path, seen: Option<Stamp>, content: &[u8]) -> std::io::Result<Option<Stamp>> {
-    // Next to it, in its private directory, under any other name than its own.
-    let new = if local.file_name().is_some_and(|n| n == ".kraal-new") { ".kraal-new-1" } else { ".kraal-new" };
-    let temp = local.with_file_name(new);
-    let _ = std::fs::remove_file(&temp);
-    write_new(&temp, content)?;
-    if stamp(local) != seen {
-        let _ = std::fs::remove_file(&temp);
-        return Ok(None);
+    replace_copy_with(local, seen, content, || {}, || {}, || {})
+}
+
+fn replace_copy_with(
+    local: &Path,
+    seen: Option<Stamp>,
+    content: &[u8],
+    before_move: impl FnOnce(),
+    before_install: impl FnOnce(),
+    before_cleanup: impl FnOnce(),
+) -> std::io::Result<Option<Stamp>> {
+    use crate::paths::rename_no_replace;
+
+    // A sibling of the edit's directory survives cleanup when its editor ends.
+    let base = local.parent().and_then(Path::parent).ok_or_else(|| std::io::Error::other("no edit directory"))?;
+    let dir = private_dir(base)?;
+    let new = dir.join("new");
+    let old = dir.join("previous");
+    let regular = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+    let result = (|| {
+        write_new(&new, content)?;
+        if seen.is_none() || stamp(local) != seen || !regular(local) {
+            return Ok(None);
+        }
+        before_move();
+        rename_no_replace(local, &old)?;
+        if !regular(&old) || stamp(&old) != seen {
+            return Ok(None);
+        }
+        let written = stamp(&new);
+        before_install();
+        rename_no_replace(&new, local)?;
+        if stamp(&old) != seen {
+            return Err(std::io::Error::other("the editor saved to the moved file"));
+        }
+        Ok(written)
+    })();
+    before_cleanup();
+    // Keep the inode named even after success: an editor may still have it open.
+    if matches!(result, Ok(Some(_))) {
+        return result;
     }
-    std::fs::rename(&temp, local)?;
-    Ok(stamp(local))
+    if std::fs::symlink_metadata(&old).is_ok()
+        && let Err(err) = rename_no_replace(&old, local)
+    {
+        return Err(std::io::Error::other(format!(
+            "the editor's copy could not be restored: {err}; recovery copies are in {}",
+            dir.display()
+        )));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 /// Keep `content` in `dir` as `name`, or `name-1`, `name-2`… (before its extension) when that
