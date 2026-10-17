@@ -8,12 +8,12 @@
   <a href="#install">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="docs/README.md">Docs</a> ·
-  <a href="https://github.com/kraal-sh/kraal/releases">Releases</a>
+  <a href="https://github.com/vodhash/kraal/releases">Releases</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/kraal-sh/kraal/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kraal-sh/kraal/ci.yml?branch=main&label=ci"></a>
-  <a href="https://github.com/kraal-sh/kraal/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/kraal-sh/kraal?label=release"></a>
+  <a href="https://github.com/vodhash/kraal/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/vodhash/kraal/ci.yml?branch=main&label=ci"></a>
+  <a href="https://github.com/vodhash/kraal/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/vodhash/kraal?label=release"></a>
   <a href="https://crates.io/crates/kraal"><img alt="crates.io" src="https://img.shields.io/crates/v/kraal"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
@@ -56,7 +56,7 @@ waiting for you.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kraal-sh/kraal/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/vodhash/kraal/main/install.sh | sh
 ```
 
 Or, with Rust 1.88 or later:
@@ -65,7 +65,7 @@ Or, with Rust 1.88 or later:
 cargo install kraal
 ```
 
-The script takes the [prebuilt archive](https://github.com/kraal-sh/kraal/releases) for your
+The script takes the [prebuilt archive](https://github.com/vodhash/kraal/releases) for your
 machine (Linux and macOS, x86_64 and arm64), checks its checksum and installs into
 `~/.local/bin`. To update later, `kraal update` for the script's install, `cargo install kraal`
 again for Cargo's. [More ways](docs/install.md)
@@ -181,7 +181,7 @@ nobody uses it daily yet; Windows is not supported. Known gaps:
 - Agent states come from hooks for Claude Code and eight other agents, and for what Gemini CLI's,
   Codex's, Cursor's and Augment's hooks tell; otherwise they are read from the screen and can lag.
 
-Bug reports and ideas are welcome in the [issues](https://github.com/kraal-sh/kraal/issues).
+Bug reports and ideas are welcome in the [issues](https://github.com/vodhash/kraal/issues).
 
 ## Development
 

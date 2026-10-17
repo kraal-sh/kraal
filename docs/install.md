@@ -7,11 +7,11 @@ supported.
 ## The install script
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kraal-sh/kraal/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/vodhash/kraal/main/install.sh | sh
 ```
 
 The script takes the archive for your machine from the
-[releases](https://github.com/kraal-sh/kraal/releases) and checks it against its checksum before
+[releases](https://github.com/vodhash/kraal/releases) and checks it against its checksum before
 installing anything, into `~/.local/bin`. Settings:
 
 | Variable | |
@@ -58,12 +58,12 @@ The same command again updates it; `kraal update` leaves a kraal that Cargo inst
 The main branch instead:
 
 ```sh
-cargo install --git https://github.com/kraal-sh/kraal
+cargo install --git https://github.com/vodhash/kraal
 ```
 
 ## By hand
 
-Each [release](https://github.com/kraal-sh/kraal/releases) has an archive per platform, its
+Each [release](https://github.com/vodhash/kraal/releases) has an archive per platform, its
 `.sha256`, and `SHA256SUMS`. The Linux builds are static (musl), so they run on any
 distribution.
 
