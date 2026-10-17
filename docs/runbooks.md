@@ -78,8 +78,13 @@ and the value is held to the list once the runbook is approved.
 A Markdown runbook is read like any document. `ctrl+b R b` opens it next to
 the focused pane and lists its shell blocks (```` ```sh ````, `bash`, `console`…); enter sends a
 block to that pane and runs it, and `ctrl+b R b` again offers the next one. kraal refuses while a
-program other than the shell runs in that pane (the block would go to it); in an SSH pane it
-cannot tell, and asks first. It knows a block was sent, not whether it succeeded: watch the pane.
+program other than the shell runs in that pane (the block would go to it), and while text is
+typed at the shell's prompt (`sudo ` and the block would run as one command): clear the line
+first. It sees the prompt when the shell marks it ([shell integration](terminal.md#shell-commands));
+otherwise, and in an SSH pane, it cannot tell, and asks first, once for the document. Once the
+pane changed size, it asks before each block until the shell marks a new prompt. After zsh's `ctrl+l`, press Enter
+on the empty line for a prompt it sees again. It knows a block was sent, not whether it
+succeeded: watch the pane.
 Of a `console` block, only the lines after a `$` prompt are sent. Your existing procedure docs
 become runnable without being rewritten.
 

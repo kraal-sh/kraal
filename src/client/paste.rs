@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 const START: &[u8] = b"\x1b[200~";
 const END: &[u8] = b"\x1b[201~";
 pub const LIMIT: usize = 64 * 1024;
+const PERMISSIONS_MAX: u64 = 1 << 20;
 
 pub enum Part {
     Start,
@@ -110,7 +111,8 @@ pub fn permission_path() -> PathBuf {
 }
 
 fn permissions(path: &Path) -> Result<Permissions> {
-    match std::fs::read_to_string(path) {
+    // Bounded and regular files only: a FIFO or a link to a device must not hang or grant.
+    match crate::paths::read_regular_text(path, PERMISSIONS_MAX) {
         Ok(text) => Ok(toml::from_str(&text)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Permissions::default()),
         Err(e) => Err(e.into()),
@@ -289,5 +291,23 @@ mod tests {
         assert!(!laptop_write_allowed(&path, &["other".into()]));
         std::fs::remove_file(&path).unwrap();
         assert!(!laptop_write_allowed(&path, &ssh));
+    }
+
+    #[test]
+    fn oversized_or_special_permission_files_grant_nothing_promptly() {
+        let dir = crate::testing::TempDir::new("laptop-grant-bounded");
+        let path = dir.0.join("laptop-files.toml");
+        let ssh = vec!["me@anvil".into()];
+        let grant = "[[laptop_copy]]\nwrite = true\nname = 'anvil'\nssh = ['me@anvil']\n";
+        std::fs::write(&path, format!("{grant}#{}\n", " ".repeat(PERMISSIONS_MAX as usize))).unwrap();
+        assert!(!laptop_allowed(&path, &ssh) && !laptop_write_allowed(&path, &ssh));
+        assert!(remember_laptop(&path, &ssh, "anvil").is_err());
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is terminated and belongs to this test.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(laptop_allowed(&path, &ssh)).unwrap());
+        assert!(!rx.recv_timeout(crate::testing::PATIENCE).expect("a FIFO without a writer must not block"));
     }
 }

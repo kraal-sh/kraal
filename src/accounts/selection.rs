@@ -112,7 +112,11 @@ impl Accounts {
         usage: &UsageMap,
         now: i64,
     ) -> Option<Account> {
-        let candidates = self.candidates(agent, workspace, cwd);
+        let mut candidates = self.candidates(agent, workspace, cwd);
+        // An account awaiting sign-in would open on its login screen: only when there is no other.
+        if candidates.iter().any(|a| !a.sign_in_required) {
+            candidates.retain(|a| !a.sign_in_required);
+        }
         if let Some(a) = candidates.iter().find(|a| usage.peak(a, now).is_some_and(|p| p < self.threshold(a) as f64)) {
             return Some(a.clone());
         }
@@ -122,9 +126,9 @@ impl Accounts {
         candidates.into_iter().min_by_key(|a| usage.get(a).and_then(|u| u.next_reset(now)).unwrap_or(i64::MAX))
     }
 
-    /// Another account of the same agent to continue on, under its threshold. When a rule
-    /// covers this context, only its accounts are considered: work never moves to an account
-    /// the rule does not list.
+    /// Another account of the same agent to continue on, under its threshold, other than those
+    /// `skip` leaves out. When a rule covers this context, only its accounts are considered: work
+    /// never moves to an account the rule does not list.
     pub fn alternative(
         &self,
         current: &Account,
@@ -132,10 +136,12 @@ impl Accounts {
         cwd: Option<&Path>,
         usage: &UsageMap,
         now: i64,
+        skip: impl Fn(&Account) -> bool,
     ) -> Option<Account> {
         self.candidates(&current.agent, workspace, cwd).into_iter().find(|a| {
             a.id != current.id
                 && !a.same_home(current)
+                && !skip(a)
                 && !a.sign_in_required
                 && !a.review
                 && usage.peak(a, now).is_some_and(|p| p < self.threshold(a) as f64)

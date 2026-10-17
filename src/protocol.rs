@@ -510,6 +510,9 @@ pub enum Request {
         state: Option<AgentState>,
         session_id: Option<String>,
         message: Option<String>,
+        /// The hook is the agent taking a prompt (the user's, sent): a draft went with it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prompt: bool,
     },
     Notify {
         title: String,
@@ -934,6 +937,7 @@ mod tests {
                 state: Some(AgentState::Working),
                 session_id: Some(s("x")),
                 message: Some(s("m")),
+                prompt: true,
             },
             Request::Notify { title: s("t"), body: s("b") },
             Request::RunbookPlan {

@@ -954,6 +954,28 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_restart_does_not_name_the_closed_workspace_a_client_shows() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let (id, _peer) = super::super::tests::client(&mut server);
+        let ws = server.clients[&id].workspace;
+        writer(&mut server, vec![]);
+        server.keep_and_close_workspace(ws).unwrap();
+        assert_eq!(server.clients[&id].workspace, ws);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        server.restarting = true;
+        server.shutdown();
+        let reattach = receive.try_iter().find_map(|frame| {
+            let (_, payload) = crate::protocol::read_frame(&mut frame.as_slice()).unwrap()?;
+            match serde_json::from_slice(&payload) {
+                Ok(crate::protocol::ServerMsg::Exit { reattach, .. }) => Some(reattach),
+                _ => None,
+            }
+        });
+        assert_eq!(reattach, Some(Some(String::new())));
+    }
+
+    #[test]
     fn workspace_identity_survives_renaming_reordering_and_restoring() {
         use crate::layout::Node;
         use crate::pane::PaneSpec;

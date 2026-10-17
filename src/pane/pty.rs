@@ -538,7 +538,7 @@ fn spawn_dir(cwd: Option<&Path>, strict: bool) -> Result<(PathBuf, bool)> {
     match (cwd.and_then(|d| std::fs::canonicalize(d).ok()).filter(|d| d.is_dir()), cwd) {
         (Some(dir), _) => Ok((dir, strict)),
         (None, Some(dir)) if strict => anyhow::bail!("{} is not a directory it can run in", dir.display()),
-        _ => Ok((dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")), false)),
+        _ => Ok((crate::paths::home_dir().unwrap_or_else(|| PathBuf::from("/")), false)),
     }
 }
 

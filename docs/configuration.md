@@ -27,8 +27,9 @@ input while these files are read.
 
 Automatic scans check file metadata and directory listings on ticks at least five seconds
 apart, without opening or reading file contents on the server loop. Unchanged inputs do not
-start a background scan. Changes, pending scan requests and failed scans trigger another
-read; a change during a scan is checked again so it is not lost. Idle sessions keep their
+start a background scan. Changes, pending scan requests and failed reads trigger another
+read; a file that cannot be parsed is read again once it changes. A change during a scan is
+checked again so it is not lost. Idle sessions keep their
 slower tick rate. This covers the configuration files, workspace definition directories and
 linked sources, and SSH host files and included directories when `ssh_config_hosts` is on.
 Changes to `config.toml` still need `kraal config reload` to apply settings.
@@ -77,7 +78,8 @@ Workspaces and leaves that preference unchanged. See [the strip](workspaces.md) 
 [Persistence](workspaces.md#persistence)). Scrollback can hold secrets: `false` saves none and
 deletes what was saved. Account login panes and their text are never saved, even when this
 setting is `true`. `long_command` needs a shell that marks its commands
-([Shell commands](terminal.md#shell-commands)).
+([Shell commands](terminal.md#shell-commands)). A program in a pane can send its own
+notifications (OSC 9, OSC 777): kraal passes on three per pane a second at most and drops the rest.
 
 ## Clipboard
 
@@ -222,7 +224,10 @@ persist = false          # true keeps them across restarts, in a private file
 Buffers live in the server's memory only and go when it stops: they can hold secrets (a password
 you copied, a token). `persist = true` keeps them across restarts in
 `~/.local/state/kraal/buffers/<session>.json`, a file only you can read (0600); `false` writes
-nothing and deletes that file. `kraal forget` deletes it too.
+nothing and deletes that file. A file kraal cannot read back (damaged, written by a newer kraal,
+or over 8 × `max_mb`) is moved aside to `<session>.json.bad` (`.bad.1` to `.bad.9` when that one
+is taken), and the start says so, rather than written over; when it cannot be moved, the server
+leaves it alone and saves no buffers until it restarts. `kraal forget` deletes them all.
 
 ## Worktrees
 

@@ -519,6 +519,9 @@ pub struct Server {
     config_scan_failed: bool,
     /// Servers from the inventory, workspaces and ~/.ssh/config.
     pub known_servers: Vec<crate::servers::Known>,
+    /// servers.toml was read since the server started: until then a saved tunnel's server is not
+    /// looked up by name (an ~/.ssh/config `Host` of that name may be another machine).
+    inventory_read: bool,
     /// ssh destinations already looked at for auto-adding.
     discovered: Vec<crate::servers::Server>,
     pub accounts: crate::accounts::Accounts,
@@ -652,6 +655,9 @@ pub struct Server {
     pub buffers: crate::buffers::Buffers,
     /// The buffers changed since they were last written (when they are kept across restarts).
     buffers_dirty: bool,
+    /// The buffers' file could not be read back nor moved aside: this server never writes or
+    /// deletes it, whatever the settings say.
+    buffers_file_stuck: bool,
     /// Panes closed since the last tick: the memory they held goes back to the system with it.
     panes_closed: bool,
 }
@@ -704,6 +710,15 @@ fn due(now: Instant, last: Instant, every: Duration) -> bool {
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
     let text = payload.downcast_ref::<&str>().copied();
     text.or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("it panicked")
+}
+
+/// How long to wait before accepting again after `e`: an interrupted or aborted connection is
+/// over at once, but out of descriptors or memory the pending one stays and would spin a core.
+fn accept_pause(e: &std::io::Error) -> Duration {
+    match e.kind() {
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted => Duration::ZERO,
+        _ => Duration::from_millis(20),
+    }
 }
 
 /// Why a server did not start: another kraal has its session. A server ends with
@@ -789,7 +804,7 @@ pub fn run(session: &str) -> Result<()> {
                             break;
                         }
                     }
-                    Err(_) => continue,
+                    Err(e) => std::thread::sleep(accept_pause(&e)),
                 }
             }
         })?;
@@ -825,134 +840,21 @@ pub fn run(session: &str) -> Result<()> {
             config.graphics.memory_mb.saturating_mul(1 << 20),
         )),
     };
-    let buffers = crate::buffers::Buffers::new(config.buffers.limit, config.buffers.max_bytes());
     let mut server = Server {
-        session: session.to_string(),
-        config,
-        keymap,
-        env,
-        tx,
-        panes: HashMap::new(),
-        workspaces: Vec::new(),
-        workspace_order: Vec::new(),
-        clients: HashMap::new(),
-        attachment_worker: None,
-        next_id: 1,
-        primary: None,
-        // A 120×40 terminal's, until a client attaches.
-        layout_area: Rect::new(0, 1, 120, 39 - u16::from(bottom_bar)),
-        waits: Vec::new(),
-        persist_dirty: false,
-        last_persist: Instant::now(),
-        last_tick: Instant::now(),
-        idle: false,
-        scan_polled: true,
-        kube_polled: false,
-        last_contact: Instant::now(),
-        last_scan: Instant::now() - SCAN_EVERY,
-        next_render: None,
-        image_wake: None,
-        last_frame: Instant::now(),
-        streak: 0,
-        echo: HashMap::new(),
-        redraws: HashMap::new(),
-        settle: None,
-        quitting: false,
-        kill_waiters: Vec::new(),
-        restarting: false,
-        outer_colors: None,
-        images: HashMap::new(),
-        fitted: Default::default(),
-        preparing: 0,
         warnings,
-        accounts_error: None,
-        messages: Default::default(),
-        def_files: Vec::new(),
-        last_def_scan: Instant::now(),
-        config_generation: 0,
-        reload_generation: 0,
-        config_scan: Default::default(),
-        config_scan_again: false,
-        config_inputs: None,
-        config_scan_failed: false,
-        known_servers: Vec::new(),
-        discovered: Default::default(),
-        accounts: crate::accounts::Accounts::empty(),
-        account_discovery: agents::Discovery::default(),
-        account_notices: Vec::new(),
-        starting_workspace: None,
-        usage: Default::default(),
-        usage_reset: None,
-        last_codex_poll: Instant::now() - Duration::from_secs(3600),
-        limit_alerts: HashMap::new(),
-        screen_limits: HashMap::new(),
-        switches: agents::AccountSwitches::default(),
-        pane_edits: HashMap::new(),
-        limit_events: Default::default(),
-        ready: Default::default(),
-        ready_set: Default::default(),
-        output_buf: Vec::new(),
-        unparsed: HashMap::new(),
-        watched: Vec::new(),
-        watch_at: None,
-        exiting: Default::default(),
-        focus_reported: Default::default(),
-        held_input: Vec::new(),
-        bottom_bar,
-        turn_skipped: false,
-        typed_quietly: false,
-        chrome_gen: 0,
-        facts: Default::default(),
-        account_display: Default::default(),
-        printed: Vec::new(),
-        tilings: Default::default(),
-        broadcast_tip_shown: false,
-        buffers,
-        buffers_dirty: false,
-        panes_closed: false,
-        tunnels: Vec::new(),
-        remotes: Vec::new(),
-        port_candidates: HashMap::new(),
-        ports: Default::default(),
-        git: HashMap::new(),
         dirwatch: dirwatch::DirWatch::new(watcher),
         git_requests: worktrees::spawn_git_worker(git_tx)?,
         launches: crate::pane::launcher(),
-        kube: HashMap::new(),
-        kube_cache: Default::default(),
-        tf_dirs: Default::default(),
-        hint_patterns,
-        subscribers: Vec::new(),
-        laptop_copies: HashMap::new(),
-        events: Default::default(),
-        announced: Default::default(),
         hooks: events::Hooks::new(hook_list),
-        pane_states: Default::default(),
-        drafts: HashMap::new(),
-        plans: HashMap::new(),
-        runs: Vec::new(),
-        launching: Vec::new(),
-        stray_groups: Vec::new(),
-        run_output: HashMap::new(),
-        md_sessions: HashMap::new(),
-        jobs: jobs::Jobs::default(),
-        edits: Vec::new(),
-        preview_loads: Default::default(),
-        pending_opens: Vec::new(),
         persister: spawn_persister(persist_tx, persisting.clone(), held.clone())?,
         persisting,
-        persisted: None,
-        scrollback: HashMap::new(),
-        unrestored: Vec::new(),
-        deleted_workspaces: Vec::new(),
-        removed_sources: Vec::new(),
-        scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
             let warn = logs_tx;
             crate::runbooks::spawn_log_writer(move |w| {
                 let _ = warn.send(Event::Warning(w));
             })?
         },
+        ..Server::new(env, config, keymap, hint_patterns, tx, bottom_bar)
     };
     server.scan_definitions();
     server.load_buffers();
@@ -1033,6 +935,144 @@ fn take_ready_pipe() -> Option<std::fs::File> {
 }
 
 impl Server {
+    /// A server without its background threads: what is sent to them goes nowhere. `run` starts
+    /// them in its place.
+    fn new(
+        env: PaneEnv,
+        config: Config,
+        keymap: Keymap,
+        hint_patterns: crate::hints::Custom,
+        tx: EventSender,
+        bottom_bar: bool,
+    ) -> Server {
+        let buffers = crate::buffers::Buffers::new(config.buffers.limit, config.buffers.max_bytes());
+        Server {
+            session: env.session.clone(),
+            config,
+            keymap,
+            env,
+            tx,
+            panes: HashMap::new(),
+            workspaces: Vec::new(),
+            workspace_order: Vec::new(),
+            clients: HashMap::new(),
+            attachment_worker: None,
+            next_id: 1,
+            primary: None,
+            // A 120×40 terminal's, until a client attaches.
+            layout_area: Rect::new(0, 1, 120, 39 - u16::from(bottom_bar)),
+            waits: Vec::new(),
+            persist_dirty: false,
+            last_persist: Instant::now(),
+            last_tick: Instant::now(),
+            idle: false,
+            scan_polled: true,
+            kube_polled: false,
+            last_contact: Instant::now(),
+            last_scan: Instant::now() - SCAN_EVERY,
+            next_render: None,
+            image_wake: None,
+            last_frame: Instant::now(),
+            streak: 0,
+            echo: HashMap::new(),
+            redraws: HashMap::new(),
+            settle: None,
+            quitting: false,
+            kill_waiters: Vec::new(),
+            restarting: false,
+            outer_colors: None,
+            images: HashMap::new(),
+            fitted: Default::default(),
+            preparing: 0,
+            warnings: Vec::new(),
+            accounts_error: None,
+            messages: Default::default(),
+            def_files: Vec::new(),
+            last_def_scan: Instant::now(),
+            config_generation: 0,
+            reload_generation: 0,
+            config_scan: Default::default(),
+            config_scan_again: false,
+            config_inputs: None,
+            config_scan_failed: false,
+            known_servers: Vec::new(),
+            inventory_read: false,
+            discovered: Default::default(),
+            accounts: crate::accounts::Accounts::empty(),
+            account_discovery: agents::Discovery::default(),
+            account_notices: Vec::new(),
+            starting_workspace: None,
+            usage: Default::default(),
+            usage_reset: None,
+            last_codex_poll: Instant::now() - Duration::from_secs(3600),
+            limit_alerts: HashMap::new(),
+            screen_limits: HashMap::new(),
+            switches: agents::AccountSwitches::default(),
+            pane_edits: HashMap::new(),
+            limit_events: Default::default(),
+            ready: Default::default(),
+            ready_set: Default::default(),
+            output_buf: Vec::new(),
+            unparsed: HashMap::new(),
+            watched: Vec::new(),
+            watch_at: None,
+            exiting: Default::default(),
+            focus_reported: Default::default(),
+            held_input: Vec::new(),
+            bottom_bar,
+            turn_skipped: false,
+            typed_quietly: false,
+            chrome_gen: 0,
+            facts: Default::default(),
+            account_display: Default::default(),
+            printed: Vec::new(),
+            tilings: Default::default(),
+            broadcast_tip_shown: false,
+            buffers,
+            buffers_dirty: false,
+            buffers_file_stuck: false,
+            panes_closed: false,
+            tunnels: Vec::new(),
+            remotes: Vec::new(),
+            port_candidates: HashMap::new(),
+            ports: Default::default(),
+            git: HashMap::new(),
+            dirwatch: dirwatch::DirWatch::new(None),
+            git_requests: crossbeam_channel::unbounded().0,
+            launches: crossbeam_channel::unbounded().0,
+            kube: HashMap::new(),
+            kube_cache: Default::default(),
+            tf_dirs: Default::default(),
+            hint_patterns,
+            subscribers: Vec::new(),
+            laptop_copies: HashMap::new(),
+            events: Default::default(),
+            announced: Default::default(),
+            hooks: events::Hooks::new(Vec::new()),
+            pane_states: Default::default(),
+            drafts: HashMap::new(),
+            plans: HashMap::new(),
+            runs: Vec::new(),
+            launching: Vec::new(),
+            stray_groups: Vec::new(),
+            run_output: HashMap::new(),
+            md_sessions: HashMap::new(),
+            jobs: jobs::Jobs::default(),
+            edits: Vec::new(),
+            preview_loads: Default::default(),
+            pending_opens: Vec::new(),
+            persister: crossbeam_channel::unbounded().0,
+            persisting: Default::default(),
+            persisted: None,
+            scrollback: HashMap::new(),
+            unrestored: Vec::new(),
+            deleted_workspaces: Vec::new(),
+            removed_sources: Vec::new(),
+            scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
+            run_logs: crossbeam_channel::unbounded().0,
+        }
+    }
+
     /// Show `mode` (a question a background job prepared) unless the client is busy with
     /// another picker or prompt: then the question is dropped (the client is told to ask again).
     pub fn set_mode_if_idle(&mut self, client: ClientId, mode: Mode) {
@@ -2015,11 +2055,12 @@ impl Server {
         self.hooks.stop_all();
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for id in ids {
-            // On a restart, attached clients come back to the workspace they show.
+            // On a restart, attached clients come back to the workspace they show; one that was
+            // closed (or is gone) is not named, or attaching would reopen it.
             let shown = self.clients.get(&id).filter(|c| c.attached).map(|c| c.workspace);
             let reattach = shown.filter(|_| self.restarting).map(|ws| {
-                let wi = self.ws_index(ws).unwrap_or(0);
-                self.workspaces.get(wi).map(|w| w.name.clone()).unwrap_or_default()
+                let open = self.ws_index(ws).map(|wi| &self.workspaces[wi]).filter(|w| !w.closed());
+                open.map(|w| w.name.clone()).unwrap_or_default()
             });
             self.graphics_farewell(id);
             self.send_msg(id, &ServerMsg::Exit { reason: reason.clone(), reattach });
@@ -2072,7 +2113,6 @@ mod tests {
         let config = Config::default();
         let keymap = Keymap::build(&config.keys).0;
         let hint_patterns = crate::hints::Custom::build(&config.hints, &config.tools).0;
-        let bottom_bar = false;
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "publication-test".into(),
@@ -2080,130 +2120,7 @@ mod tests {
             scrollback: 100,
             graphics: Default::default(),
         };
-        let buffers = crate::buffers::Buffers::new(config.buffers.limit, config.buffers.max_bytes());
-        Server {
-            session: "publication-test".into(),
-            config,
-            keymap,
-            env,
-            tx,
-            panes: HashMap::new(),
-            workspaces: Vec::new(),
-            workspace_order: Vec::new(),
-            clients: HashMap::new(),
-            attachment_worker: None,
-            next_id: 1,
-            primary: None,
-            // A 120×40 terminal's, until a client attaches.
-            layout_area: Rect::new(0, 1, 120, 39 - u16::from(bottom_bar)),
-            waits: Vec::new(),
-            persist_dirty: false,
-            last_persist: Instant::now(),
-            last_tick: Instant::now(),
-            idle: false,
-            scan_polled: true,
-            kube_polled: false,
-            last_contact: Instant::now(),
-            last_scan: Instant::now() - SCAN_EVERY,
-            next_render: None,
-            image_wake: None,
-            last_frame: Instant::now(),
-            streak: 0,
-            echo: HashMap::new(),
-            redraws: HashMap::new(),
-            settle: None,
-            quitting: false,
-            kill_waiters: Vec::new(),
-            restarting: false,
-            outer_colors: None,
-            images: HashMap::new(),
-            fitted: Default::default(),
-            preparing: 0,
-            warnings: Vec::new(),
-            accounts_error: None,
-            messages: Default::default(),
-            def_files: Vec::new(),
-            last_def_scan: Instant::now(),
-            config_generation: 0,
-            reload_generation: 0,
-            config_scan: Default::default(),
-            config_scan_again: false,
-            config_inputs: None,
-            config_scan_failed: false,
-            known_servers: Vec::new(),
-            discovered: Default::default(),
-            accounts: crate::accounts::Accounts::empty(),
-            account_discovery: agents::Discovery::default(),
-            account_notices: Vec::new(),
-            starting_workspace: None,
-            usage: Default::default(),
-            usage_reset: None,
-            last_codex_poll: Instant::now() - Duration::from_secs(3600),
-            limit_alerts: HashMap::new(),
-            screen_limits: HashMap::new(),
-            switches: agents::AccountSwitches::default(),
-            pane_edits: HashMap::new(),
-            limit_events: Default::default(),
-            ready: Default::default(),
-            ready_set: Default::default(),
-            output_buf: Vec::new(),
-            unparsed: HashMap::new(),
-            watched: Vec::new(),
-            watch_at: None,
-            exiting: Default::default(),
-            focus_reported: Default::default(),
-            held_input: Vec::new(),
-            bottom_bar,
-            turn_skipped: false,
-            typed_quietly: false,
-            chrome_gen: 0,
-            facts: Default::default(),
-            account_display: Default::default(),
-            printed: Vec::new(),
-            tilings: Default::default(),
-            broadcast_tip_shown: false,
-            buffers,
-            buffers_dirty: false,
-            panes_closed: false,
-            tunnels: Vec::new(),
-            remotes: Vec::new(),
-            port_candidates: HashMap::new(),
-            ports: Default::default(),
-            git: HashMap::new(),
-            dirwatch: dirwatch::DirWatch::new(None),
-            git_requests: crossbeam_channel::unbounded().0,
-            launches: crossbeam_channel::unbounded().0,
-            kube: HashMap::new(),
-            kube_cache: Default::default(),
-            tf_dirs: Default::default(),
-            hint_patterns,
-            subscribers: Vec::new(),
-            laptop_copies: HashMap::new(),
-            events: Default::default(),
-            announced: Default::default(),
-            hooks: events::Hooks::new(Vec::new()),
-            pane_states: Default::default(),
-            drafts: HashMap::new(),
-            plans: HashMap::new(),
-            runs: Vec::new(),
-            launching: Vec::new(),
-            stray_groups: Vec::new(),
-            run_output: HashMap::new(),
-            md_sessions: HashMap::new(),
-            jobs: jobs::Jobs::default(),
-            edits: Vec::new(),
-            preview_loads: Default::default(),
-            pending_opens: Vec::new(),
-            persister: crossbeam_channel::unbounded().0,
-            persisting: Default::default(),
-            persisted: None,
-            scrollback: HashMap::new(),
-            unrestored: Vec::new(),
-            deleted_workspaces: Vec::new(),
-            removed_sources: Vec::new(),
-            scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
-            run_logs: crossbeam_channel::unbounded().0,
-        }
+        Server::new(env, config, keymap, hint_patterns, tx, false)
     }
     #[test]
     fn output_poll_yields_while_output_waits() {
@@ -2348,5 +2265,15 @@ mod tests {
         tab.preset = None;
         assert!(tab.remove(1));
         assert_eq!(tab.root.as_ref().and_then(|r| r.stack_of(2)), Some((&[2, 4][..], 4)));
+    }
+
+    #[test]
+    fn accepting_waits_when_out_of_descriptors() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(accept_pause(&std::io::Error::from_raw_os_error(errno)) > Duration::ZERO);
+        }
+        for errno in [libc::EINTR, libc::ECONNABORTED] {
+            assert_eq!(accept_pause(&std::io::Error::from_raw_os_error(errno)), Duration::ZERO);
+        }
     }
 }

@@ -46,8 +46,18 @@ impl Server {
             }
         }
         let title = if title.is_empty() { r.name.clone() } else { title };
-        let session =
-            MdSession { runbook: r, title, blocks, target, sent: HashSet::new(), approved: None, remote_ok: false };
+        let session = MdSession {
+            runbook: r,
+            title,
+            blocks,
+            target,
+            sent: HashSet::new(),
+            approved: None,
+            remote_ok: false,
+            unsure_ok: false,
+            asked_remote: false,
+            asked_unsure: false,
+        };
         self.md_sessions.insert(client, session);
         Mode::Picker(self.md_picker(client, 0, false))
     }
@@ -206,6 +216,14 @@ impl Server {
             let what = what.rsplit('/').next().unwrap_or(&what).to_string();
             return Err(format!("{label} is running {what}, not a shell at its prompt: the step was not sent"));
         }
+        // Typed after a draft (`sudo `), the step would run as one command with it.
+        let empty = pane.prompt_empty();
+        if empty == Some(false) {
+            return Err(format!(
+                "{label} has text at its prompt, which the step would run with: clear the line (or press Enter if \
+                 it is empty), then run the step again"
+            ));
+        }
         let mut concerns = Vec::new();
         if let Source::Repo(root) = &s.runbook.source
             && s.unapproved()
@@ -221,13 +239,29 @@ impl Server {
         {
             concerns.push(format!("{label} is production ({why})."));
         }
+        let (mut remote, mut unsure) = (false, false);
         if let Some(server) = &pane.ssh
             && !s.remote_ok
         {
+            remote = true;
             concerns.push(format!(
                 "{label} is on {}: kraal cannot see whether a program waits there; the step is typed as is.",
                 server.name
             ));
+        }
+        // Without shell integration, one answer for the session; a marked prompt whose place a new
+        // size lost is asked about at each step (a draft may sit there).
+        let marked = pane.prompt_marked();
+        if pane.ssh.is_none() && empty.is_none() && !(if marked { s.unsure_ok } else { s.remote_ok }) {
+            (remote, unsure) = (remote || !marked, unsure || marked);
+            concerns.push(format!(
+                "kraal cannot see whether text is typed at {label}'s prompt (`kraal integration install` lets it \
+                 see); the step is typed after it."
+            ));
+        }
+        // A yes answers what was asked, not what came up while the question was open.
+        if let Some(s) = self.md_sessions.get_mut(&client) {
+            (s.asked_remote, s.asked_unsure) = (remote, unsure);
         }
         Ok(concerns)
     }
@@ -256,14 +290,20 @@ impl Server {
         // What the question showed is what is approved: a pane that became production since is
         // asked about again by the check below.
         s.approved = production;
-        s.remote_ok = true;
+        s.remote_ok |= s.asked_remote;
+        s.unsure_ok = s.asked_unsure;
         if matches!(s.runbook.source, Source::Repo(_))
             && let Err(e) = runbooks::trust(&s.runbook)
         {
             self.warnings.push(format!("{e:#}"));
         }
-        // The answer may come late: check again right before typing.
-        match self.block_check(client, index) {
+        // The answer may come late: check again right before typing. A prompt kraal cannot see is
+        // approved for this check only.
+        let check = self.block_check(client, index);
+        if let Some(s) = self.md_sessions.get_mut(&client) {
+            s.unsure_ok = false;
+        }
+        match check {
             Ok(concerns) if concerns.is_empty() => self.send_block(client, index),
             Ok(_) => self.ask_block(client, index),
             Err(why) => {
@@ -298,5 +338,65 @@ impl Server {
         if let Some(code) = self.md_sessions.get(&client).and_then(|s| s.blocks.get(index)).map(|b| b.code.clone()) {
             self.copy_to_client(client, &code);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_draft_at_the_prompt_refuses_the_step() {
+        let (tx, _rx) = crate::server::event_channel(64);
+        let mut server = crate::server::tests::server(tx);
+        let target = server.spawn_pane(None, PaneSpec { command: vec!["sh".into()], ..Default::default() }).unwrap();
+        let start = std::time::Instant::now();
+        while !server.panes[&target].shell_waiting() {
+            assert!(start.elapsed() < crate::testing::PATIENCE, "sh never waited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let blocks = vec![runbooks::Block { heading: String::new(), code: "systemctl restart nginx".into() }];
+        let body = Body::Markdown { title: String::new(), blocks: blocks.clone() };
+        let runbook = Runbook {
+            name: "restart".into(),
+            path: "/missing/restart.md".into(),
+            source: Source::User,
+            content: String::new(),
+            body,
+        };
+        let session = MdSession {
+            runbook,
+            title: "restart".into(),
+            blocks,
+            target,
+            sent: HashSet::new(),
+            approved: None,
+            remote_ok: false,
+            unsure_ok: false,
+            asked_remote: false,
+            asked_unsure: false,
+        };
+        server.md_sessions.insert(0, session);
+        // What a shell marking its prompt shows: nothing typed, then `sudo ` typed.
+        server.panes.get_mut(&target).unwrap().feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(server.block_check(0, 0), Ok(Vec::new()));
+        server.panes.get_mut(&target).unwrap().feed(b"sudo ");
+        let refused = server.block_check(0, 0).unwrap_err();
+        assert!(refused.contains("has text at its prompt"), "{refused}");
+        // A new size loses the prompt's place: an earlier yes does not cover the next step.
+        server.md_sessions.get_mut(&0).unwrap().remote_ok = true;
+        let pane = server.panes.get_mut(&target).unwrap();
+        pane.resize(pane.cols + 10, pane.rows);
+        let concerns = server.block_check(0, 0).unwrap();
+        assert!(concerns.iter().any(|c| c.contains("cannot see whether text is typed")), "{concerns:?}");
+        server.md_sessions.get_mut(&0).unwrap().unsure_ok = true;
+        assert_eq!(server.block_check(0, 0), Ok(Vec::new()));
+        // A question that did not show it does not approve it: the answer asks again.
+        let s = server.md_sessions.get_mut(&0).unwrap();
+        (s.unsure_ok, s.asked_unsure) = (false, false);
+        assert!(!matches!(server.approve_block(0, 0, None), Mode::Normal));
+        let s = &server.md_sessions[&0];
+        assert!(s.sent.is_empty() && s.asked_unsure && !s.unsure_ok);
+        server.panes.get_mut(&target).unwrap().kill();
     }
 }

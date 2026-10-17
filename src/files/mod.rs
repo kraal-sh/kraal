@@ -26,7 +26,7 @@ mod tests;
 mod view;
 
 pub(crate) use listing::remote_dir_arg;
-use listing::{Listing, Ssh, home_dir, list};
+use listing::{Listing, Ssh, list};
 use view::{Geometry, buffer_rows, footer_layout, geometry};
 
 /// Viewport assumed before the first render.
@@ -117,7 +117,7 @@ impl Location {
     /// Like [`Location::display`], with the home directory shown as `~`.
     pub(crate) fn short_display(&self) -> String {
         match self {
-            Location::Local(path) => match home_dir().and_then(|home| path.strip_prefix(home).ok()) {
+            Location::Local(path) => match crate::paths::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
                 Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
                 Some(rest) => format!("~/{}", rest.display()),
                 None => path.display().to_string(),

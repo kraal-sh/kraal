@@ -95,12 +95,8 @@ pub struct AccountDetails {
     pub scroll: usize,
 }
 
-pub(super) fn agent_name(agent: &str) -> String {
-    let mut name = agent.to_string();
-    if let Some(first) = name.get_mut(..1) {
-        first.make_ascii_uppercase();
-    }
-    name
+pub(super) fn agent_name(agent: &str) -> &str {
+    crate::agent_registry::find(agent).map_or(agent, |a| a.label)
 }
 
 pub(super) fn label(a: &Account) -> String {
@@ -385,7 +381,7 @@ impl Server {
     pub(super) fn fill_account_form(&self, form: &mut AccountForm) {
         let choosing = form.choosing();
         let kind = accounts::agents().nth(form.agent).unwrap();
-        form.installed = crate::transfer::have_program(kind.command);
+        form.installed = crate::exec::have_program(kind.command);
         if matches!(form.choice, Some(AccountChoice::Existing)) {
             return;
         }
@@ -410,7 +406,7 @@ impl Server {
     pub(super) fn name_existing_form(&self, client: ClientId, existing: Account) -> AccountForm {
         let mut form = self.account_form(client);
         form.agent = accounts::agents().position(|k| k.name == existing.agent).unwrap_or(0);
-        form.installed = crate::transfer::have_program(accounts::agents().nth(form.agent).unwrap().command);
+        form.installed = crate::exec::have_program(accounts::agents().nth(form.agent).unwrap().command);
         form.name = self.accounts.proposed_name(&existing.agent, existing.public_identity.as_deref());
         form.cursor = form.name.chars().count();
         form.existing = Some(existing);
@@ -524,7 +520,7 @@ impl Server {
                 next.back = form.back;
                 return Mode::AccountForm(next);
             }
-            form.installed = crate::transfer::have_program(accounts::agents().nth(form.agent).unwrap().command);
+            form.installed = crate::exec::have_program(accounts::agents().nth(form.agent).unwrap().command);
             form.scroll = 0;
             if !form.installed {
                 form.error = Some(install_message(form.agent));

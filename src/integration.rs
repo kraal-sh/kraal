@@ -147,7 +147,9 @@ pub fn run_hook(agent: &str, arg: Option<String>) {
             if state.is_none() && session_id.is_none() {
                 return;
             }
-            Request::AgentReport { pane, agent: a.into(), state, session_id, message }
+            let event = arg.as_deref().or_else(|| payload.get("hook_event_name").and_then(Value::as_str));
+            let prompt = event.is_some_and(crate::agent::hook_prompt);
+            Request::AgentReport { pane, agent: a.into(), state, session_id, message, prompt }
         }
         "codex" => {
             // Codex passes its notification as the last argument.
@@ -159,12 +161,12 @@ pub fn run_hook(agent: &str, arg: Option<String>) {
                 _ => None,
             };
             let session_id = payload.get("thread-id").and_then(Value::as_str).map(String::from);
-            Request::AgentReport { pane, agent: "codex".into(), state, session_id, message: None }
+            Request::AgentReport { pane, agent: "codex".into(), state, session_id, message: None, prompt: false }
         }
         other => {
             // Generic: `kraal hook <agent> <state>` from any script.
             let state = arg.as_deref().and_then(AgentState::parse);
-            Request::AgentReport { pane, agent: other.into(), state, session_id: None, message: None }
+            Request::AgentReport { pane, agent: other.into(), state, session_id: None, message: None, prompt: false }
         }
     };
     let _ = client::request_quick(&socket, report);
@@ -173,20 +175,20 @@ pub fn run_hook(agent: &str, arg: Option<String>) {
 fn claude_settings_path() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".claude"))
+        .unwrap_or_else(|| crate::paths::home_dir().unwrap_or_default().join(".claude"))
         .join("settings.json")
 }
 
 fn codex_config_path() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+        .unwrap_or_else(|| crate::paths::home_dir().unwrap_or_default().join(".codex"))
         .join("config.toml")
 }
 
 /// An agent's own directory: kraal's `all` covers the agents whose directory exists.
 fn agent_dir(agent: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
+    let home = crate::paths::home_dir().unwrap_or_default();
     let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     let config = var("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
     match agent {
@@ -283,7 +285,7 @@ pub fn install(agent: &str) -> Result<String> {
     let (path, top_level) = agent_file(agent);
     match agent {
         "claude" => install_claude(&path, &crate::accounts::Accounts::path()),
-        "codex" => install_codex(&path),
+        "codex" => with_account_homes(agent, &path, &crate::accounts::Accounts::path(), install_codex),
         "cursor" => install_cursor(&path),
         "kimi" => install_kimi(&path),
         "copilot" => install_own(agent, &path, &own_file(agent)?, "hooks"),
@@ -317,7 +319,7 @@ pub fn uninstall(agent: &str) -> Result<String> {
     let (path, top_level) = agent_file(agent);
     match agent {
         "claude" => uninstall_claude(&path, &crate::accounts::Accounts::path()),
-        "codex" => uninstall_codex(&path),
+        "codex" => with_account_homes(agent, &path, &crate::accounts::Accounts::path(), uninstall_codex),
         "cursor" => uninstall_cursor(&path),
         "kimi" => uninstall_kimi(&path),
         "copilot" | "opencode" | "kilo" | "pi" => uninstall_own(agent, &path, &own_file(agent)?),
@@ -343,7 +345,23 @@ pub fn status(agent: &str) -> Result<String> {
         return Err(unknown(agent));
     }
     let (path, top_level) = agent_file(agent);
-    status_line(agent, &path, top_level)
+    let line = status_line(agent, &path, top_level)?;
+    if matches!(agent, "claude" | "codex") && installed_in(agent, &path) {
+        let file = path.file_name().unwrap_or_default();
+        let lacking: Vec<String> = account_homes(agent, &crate::accounts::Accounts::path(), &path)?
+            .iter()
+            .map(|h| h.join(file))
+            .filter(|f| !installed_in(agent, f))
+            .map(|f| f.display().to_string())
+            .collect();
+        if !lacking.is_empty() {
+            return Ok(format!(
+                "{agent}: partially installed (not in {}); run `kraal integration install {agent}`",
+                lacking.join(", ")
+            ));
+        }
+    }
+    Ok(line)
 }
 
 fn status_line(agent: &str, path: &Path, top_level: bool) -> Result<String> {
@@ -537,7 +555,64 @@ fn install_claude(path: &Path, accounts_path: &Path) -> Result<String> {
     root.insert("statusLine".into(), line);
     let added = add_nested(event_map(&mut v, path, false)?, nested("claude"), &cmd)?;
     write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
-    Ok(format!("claude: {added} hooks installed in {} (backup next to it)", path.display()))
+    let mut done = format!("claude: {added} hooks installed in {} (backup next to it)", path.display());
+    // A home made when there was no settings.json to share has none: it gets the link a new one
+    // gets. One of its own stays the user's.
+    match account_homes("claude", accounts_path, path) {
+        Ok(homes) => {
+            for dst in homes.iter().map(|h| h.join("settings.json")) {
+                if dst.symlink_metadata().is_err() {
+                    std::os::unix::fs::symlink(std::path::absolute(path)?, &dst)
+                        .with_context(|| format!("linking {}", dst.display()))?;
+                    done += &format!("\nclaude: {} linked to it", dst.display());
+                } else if !installed_in("claude", &dst) {
+                    done += &format!("\nclaude: {} is the account's own, without kraal's hooks", dst.display());
+                }
+            }
+        }
+        Err(e) => done += &format!("\nclaude: account homes skipped: {e:#}"),
+    }
+    Ok(done)
+}
+
+/// The homes of `agent`'s accounts other than the one of its file `path`: the agent reads its
+/// settings there instead.
+fn account_homes(agent: &str, accounts_path: &Path, path: &Path) -> Result<Vec<PathBuf>> {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let default = canonical(path.parent().unwrap_or(path));
+    let accounts = crate::accounts::Accounts::load_from(accounts_path)?.for_agent(agent);
+    Ok(accounts
+        .iter()
+        .map(|a| canonical(&crate::paths::expand_tilde(&a.home)))
+        .filter(|h| h.is_dir() && *h != default)
+        .collect())
+}
+
+/// `edit` (install or uninstall) on an agent's file, then on the same file in its account homes.
+fn with_account_homes(
+    agent: &str,
+    path: &Path,
+    accounts_path: &Path,
+    edit: fn(&Path) -> Result<String>,
+) -> Result<String> {
+    let mut done = edit(path)?;
+    let homes = match account_homes(agent, accounts_path, path) {
+        Ok(homes) => homes,
+        Err(e) => return Ok(format!("{done}\n{agent}: account homes skipped: {e:#}")),
+    };
+    for home in homes {
+        match edit(&home.join(path.file_name().unwrap_or_default())) {
+            Ok(m) if m.ends_with("nothing to remove") => {}
+            Ok(m) => done += &format!("\n{m}"),
+            Err(e) => done += &format!("\n{agent}: {}: {e:#}", home.display()),
+        }
+    }
+    Ok(done)
+}
+
+/// Whether all of kraal's hooks for `agent` are in `path`.
+fn installed_in(agent: &str, path: &Path) -> bool {
+    status_line(agent, path, false).is_ok_and(|l| l.starts_with(&format!("{agent}: installed (")))
 }
 
 fn uninstall_claude(path: &Path, accounts_path: &Path) -> Result<String> {
@@ -547,7 +622,11 @@ fn uninstall_claude(path: &Path, accounts_path: &Path) -> Result<String> {
     if let Some(root) = v.as_object_mut()
         && root.get("statusLine").and_then(|s| s.get("command")).and_then(Value::as_str).is_some_and(is_our_statusline)
     {
-        let original = crate::accounts::Accounts::load_from(accounts_path).ok().and_then(|a| a.claude.statusline);
+        // Unreadable, the saved line is not known: removing ours would lose the user's.
+        let original = crate::accounts::Accounts::load_from(accounts_path)
+            .context("kraal cannot read the status line it replaced; settings.json is unchanged")?
+            .claude
+            .statusline;
         match original {
             Some(cmd) => root["statusLine"]["command"] = json!(cmd),
             None => {
@@ -1304,7 +1383,7 @@ end
 "#;
 
 fn shell_rc_path(shell: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
+    let home = crate::paths::home_dir().unwrap_or_default();
     match shell {
         "zsh" => std::env::var_os("ZDOTDIR").map(PathBuf::from).unwrap_or(home).join(".zshrc"),
         "bash" => home.join(".bashrc"),
@@ -1513,6 +1592,53 @@ mod tests {
         let v = read_json(&path).unwrap();
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert!(v["hooks"].get("PreToolUse").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uninstall_keeps_the_status_line_when_the_saved_one_cannot_be_read() {
+        let dir = tmp("claude-unreadable-accounts");
+        let (path, accounts) = (dir.join("settings.json"), dir.join("accounts.toml"));
+        std::fs::write(&path, r#"{"statusLine":{"type":"command","command":"my-line"}}"#).unwrap();
+        install_claude(&path, &accounts).unwrap();
+        let installed = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&accounts, "not toml [").unwrap();
+        assert!(uninstall_claude(&path, &accounts).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), installed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn account_homes_made_before_the_hooks_get_them() {
+        let dir = tmp("account-homes");
+        let accounts = dir.join("accounts.toml");
+        let [claude, pro, own, codex, work] = ["claude", "claude-pro", "claude-own", "codex", "codex-work"].map(|h| {
+            std::fs::create_dir_all(dir.join(h)).unwrap();
+            dir.join(h)
+        });
+        std::fs::write(own.join("settings.json"), "{}\n").unwrap();
+        std::fs::write(work.join("config.toml"), "model = \"o3\"\n").unwrap();
+        crate::accounts::Accounts::update_at(&accounts, |all| {
+            for (agent, name, home) in [("claude", "pro", &pro), ("claude", "own", &own), ("codex", "work", &work)] {
+                all.add(crate::accounts::Account::new(agent, name, home.display().to_string(), None, false))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let settings = claude.join("settings.json");
+        let done = install_claude(&settings, &accounts).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(pro.join("settings.json")).unwrap(),
+            std::fs::canonicalize(&settings).unwrap()
+        );
+        assert!(installed_in("claude", &pro.join("settings.json")), "{done}");
+        assert_eq!(std::fs::read_to_string(own.join("settings.json")).unwrap(), "{}\n", "the account's own stays");
+        assert!(done.contains("without kraal's hooks"), "{done}");
+        let config = codex.join("config.toml");
+        with_account_homes("codex", &config, &accounts, install_codex).unwrap();
+        assert!(installed_in("codex", &config) && installed_in("codex", &work.join("config.toml")));
+        with_account_homes("codex", &config, &accounts, uninstall_codex).unwrap();
+        assert_eq!(std::fs::read_to_string(work.join("config.toml")).unwrap(), "model = \"o3\"\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 

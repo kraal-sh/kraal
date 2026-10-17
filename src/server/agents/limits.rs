@@ -59,7 +59,8 @@ impl Server {
             if let (true, Some((weekly, pct))) = (fresh, screen_limit) {
                 let mut u = self.usage.get(&a).cloned().unwrap_or_default();
                 u.observe_screen(weekly, pct, now);
-                let _ = accounts::save_usage(&a, &u);
+                // Saving waits for the file's lock, which a status line may hold: not on the loop.
+                save_in_order(a.clone(), u.clone());
                 self.usage.0.insert(a.key(), u);
                 self.await_usage_reset();
             }
@@ -78,7 +79,8 @@ impl Server {
             // Restarting an agent mid-turn loses its work: switch by itself only when the agent's
             // own hooks said it finished, never on a guess from the screen; and never when its
             // command must be shown before it runs again (it may send a prompt again).
-            let auto_ok = (p.agent.hooked || p.exit_code.is_some()) && self.restarts_by_itself(id);
+            let auto_ok =
+                (p.agent.hooked || p.exit_code.is_some()) && self.restarts_by_itself(id) && self.unattended(id);
             let mode = if mode == LimitMode::Auto && !auto_ok { LimitMode::Ask } else { mode };
             let ws_name = self.workspace_of(id).map(|(wi, _)| self.workspaces[wi].name.clone());
             let cwd = p.current_cwd();
@@ -87,7 +89,9 @@ impl Server {
                 self.ask_git_about(dir);
                 continue;
             }
-            let alt = self.accounts.alternative(&a, ws_name.as_deref(), cwd.as_deref(), &self.usage, now);
+            let alt = self
+                .accounts
+                .alternative(&a, ws_name.as_deref(), cwd.as_deref(), &self.usage, now, |b| self.switches.reserved(b));
             let reset = accounts::describe_reset(self.usage.get(&a).and_then(|u| u.next_reset(now)), now);
             let what = format!(
                 "{} is at {peak:.0}%{}",
@@ -144,11 +148,19 @@ impl Server {
         }
     }
 
+    /// Whether an automatic change may stop this pane's agent: it exited, or finished a turn nobody
+    /// has looked at or sent input to since, by any means (an idle prompt may hold a draft).
+    pub(super) fn unattended(&self, pane: PaneId) -> bool {
+        self.panes.get(&pane).is_some_and(|p| {
+            p.exit_code.is_some() || p.agent.state == AgentState::Done && !p.agent.typed && !self.pane_watched(pane)
+        })
+    }
+
     /// Ask every Codex account's app-server for its limits, in the background.
     pub(in crate::server) fn poll_codex_usage(&mut self) {
         self.last_codex_poll = Instant::now();
         let list: Vec<Account> = self.accounts.for_agent("codex");
-        if list.is_empty() || !crate::transfer::have_program("codex") {
+        if list.is_empty() || !crate::exec::have_program("codex") {
             return;
         }
         let tx = self.tx.clone();
@@ -171,5 +183,64 @@ impl Server {
         if let Err(e) = polling {
             self.warnings.push(format!("cannot ask Codex for its limits: {e}"));
         }
+    }
+}
+
+/// Save what the loop saw, on one thread, in the order it was seen: two observations of the same
+/// second would otherwise land in any order, and the older could be kept.
+fn save_in_order(a: Account, u: accounts::Usage) {
+    type Saver = crossbeam_channel::Sender<(Account, accounts::Usage)>;
+    static SAVER: std::sync::Mutex<Option<Saver>> = std::sync::Mutex::new(None);
+    let mut saver = SAVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if saver.is_none() {
+        let (tx, rx) = crossbeam_channel::unbounded::<(Account, accounts::Usage)>();
+        let started = crate::threads::named("usage-save").spawn(move || {
+            for (a, u) in rx {
+                let _ = accounts::save_usage(&a, &u);
+            }
+        });
+        // No thread now: never saved on the loop (the lock may be held); the next one tries again.
+        if started.is_err() {
+            return;
+        }
+        *saver = Some(tx);
+    }
+    if let Some(tx) = saver.as_ref() {
+        let _ = tx.send((a, u));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two observations of the same second, the file locked meanwhile: the later one is kept.
+    #[test]
+    fn usage_seen_on_the_loop_is_saved_in_the_order_seen() {
+        let name = format!("order-{}", crate::identity::new_uuid());
+        let a = Account::new("claude", &name, "/nonexistent".into(), None, false);
+        let file = crate::paths::state_dir().join("usage/by-id").join(format!("claude-{}.json", a.id));
+        crate::paths::ensure_private_dir(file.parent().unwrap()).unwrap();
+        let seen = |pct: f64| {
+            let mut u = accounts::Usage::default();
+            u.observe_screen(false, pct, 1_000_000);
+            u
+        };
+        crate::paths::locked(&file, || {
+            save_in_order(a.clone(), seen(90.0));
+            save_in_order(a.clone(), seen(95.0));
+        })
+        .unwrap();
+        let saved = || {
+            let u: accounts::Usage = serde_json::from_slice(&std::fs::read(&file).ok()?).ok()?;
+            u.five_hour.map(|w| w.used_percent)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while saved() != Some(95.0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(saved(), Some(95.0));
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_file_name(format!(".claude-{}.json.lock", a.id)));
     }
 }

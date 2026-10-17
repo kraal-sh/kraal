@@ -96,12 +96,15 @@ pub(in crate::server) fn snapshot(server: &Server) -> SessionSnapshot {
                     .tabs
                     .iter()
                     .map(|t| {
-                        // Login panes and shown paste buffers may hold secrets and must not return.
+                        // Login panes and shown paste buffers may hold secrets and must not return;
+                        // a restore drops floating panes that close on success (an editor, a job).
                         let floating: Vec<&crate::server::Floating> = t
                             .floating
                             .iter()
                             .filter(|f| {
-                                !server.panes.get(&f.pane).is_some_and(|p| p.shows_text() || p.spec.login.is_some())
+                                !server.panes.get(&f.pane).is_some_and(|p| {
+                                    p.shows_text() || p.spec.login.is_some() || p.spec.close_on_success
+                                })
                             })
                             .collect();
                         let mut kept = t.root.as_ref().map(|r| r.leaves()).unwrap_or_default();
@@ -202,5 +205,26 @@ mod tests {
         assert_eq!(tab.focus, None);
         assert!(crate::persist::scrollback_files(&snap).is_empty());
         assert!(!serde_json::to_string(&snap).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn floating_panes_that_close_on_success_are_left_out_as_a_restore_leaves_them_out() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx.clone());
+        let files = PaneSpec { files: Some(["/missing".into(), "/missing".into()]), ..Default::default() };
+        let job = PaneSpec { close_on_success: true, ..files.clone() };
+        let editor = server.new_workspace("editor".into(), None);
+        server.spawn_pane_in(editor, None, job.clone(), Placement::Floating, None).unwrap();
+        let ws = server.new_workspace("kept".into(), None);
+        server.spawn_pane_in(ws, None, files.clone(), Placement::Tab, None).unwrap();
+        server.spawn_pane_in(ws, None, job, Placement::Floating, None).unwrap();
+        let focused = server.spawn_pane_in(ws, None, files, Placement::Floating, Some("focused".into())).unwrap();
+        assert_eq!(server.workspaces[1].tabs[0].focus, Some(focused));
+        let mut restored = crate::server::tests::server(tx);
+        crate::server::persistence::apply(&mut restored, snapshot(&server)).unwrap();
+        assert!(restored.unrestored.is_empty(), "{:?}", restored.warnings);
+        let kept = restored.workspaces.iter().find(|w| w.name == "kept").unwrap();
+        let focus = kept.tabs[0].focus.unwrap();
+        assert_eq!(restored.panes[&focus].name.as_deref(), Some("focused"));
     }
 }

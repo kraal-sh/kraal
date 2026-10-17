@@ -1,7 +1,5 @@
 //! One-use grants and routing for the laptop copy job. No file contents are handled here.
 
-use std::fs::File;
-use std::io::Read;
 use std::time::Instant;
 
 use crate::files::{FilesAction, Location};
@@ -173,12 +171,11 @@ impl Server {
                 return;
             }
         }
-        let mut bytes = [0u8; 32];
-        if File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
+        let Ok(bytes) = crate::identity::random_bytes::<32>() else {
             self.toast(client, NoticeKind::Error, "Cannot create a laptop copy token: retry the copy");
             return;
-        }
-        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        };
+        let token = crate::identity::hex(&bytes);
         if let Some(pane) = self.start_job_env(
             client,
             match spec.operation {
@@ -626,7 +623,7 @@ mod tests {
 
     #[test]
     fn move_destination_is_shortened_only_for_the_laptop_owner() {
-        let home = dirs::home_dir().unwrap();
+        let home = crate::paths::home_dir().unwrap();
         for (destination, shown) in
             [(home.clone(), "~"), (home.join("work"), "~/work"), ("/outside/work".into(), "/outside/work")]
         {

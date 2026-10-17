@@ -80,13 +80,7 @@ fn rfc3339(s: &str) -> Option<i64> {
         }
         _ => return None,
     };
-    // Gregorian civil date to days since 1970-01-01 (including years before 1970).
-    let y = y - i64::from(m <= 2);
-    let era = y.div_euclid(400);
-    let yo = y - era * 400;
-    let mp = m + if m > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let day = era * 146097 + yo * 365 + yo / 4 - yo / 100 + doy - 719468;
+    let day = crate::text::days_from_civil(y, m as u32, d as u32);
     Some(day * 86400 + h * 3600 + min * 60 + sec - offset)
 }
 fn snapshot(v: &Value) -> Option<RateLimits> {

@@ -23,6 +23,8 @@ pub const CHUNK: usize = 64 * 1024;
 pub const WINDOW: usize = 256 * 1024 / CHUNK;
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 const ENTRIES: usize = 100_000;
+/// Path and link-target bytes a receiver keeps until installation.
+const RETAINED: usize = 64 << 20;
 pub const TOKEN_ENV: &str = "KRAAL_LAPTOP_COPY_TOKEN";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +487,7 @@ pub struct Receiver {
     destination: PathBuf,
     tops: HashSet<String>,
     seen: HashSet<String>,
+    retained: usize,
     directories: HashSet<PathBuf>,
     restore: Vec<Entry>,
     announced: Option<(u64, usize)>,
@@ -521,6 +524,7 @@ impl Receiver {
             destination: spec.destination.clone(),
             tops,
             seen: HashSet::new(),
+            retained: 0,
             directories: HashSet::from([PathBuf::new()]),
             restore: Vec::new(),
             announced: None,
@@ -546,6 +550,8 @@ impl Receiver {
             Packet::Entry(entry) => {
                 let (_, count) = self.announced.context("missing laptop copy total")?;
                 ensure!(self.current.is_none() && self.seen.len() < count, "unexpected laptop copy entry");
+                self.retained += entry.path.len() + if let Kind::Link(to) = &entry.kind { to.len() } else { 0 };
+                ensure!(self.retained <= RETAINED, "paths and link targets exceed 64 MiB: copy fewer items");
                 let path = relative(&entry.path)?;
                 let top = path.components().next().unwrap().as_os_str().to_str().unwrap();
                 ensure!(
@@ -658,11 +664,7 @@ fn lock_spool(path: &Path) -> Result<Option<File>> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path.join(".lock"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock { Ok(None) } else { Err(error.into()) }
+    Ok(crate::paths::try_lock(&file)?.then_some(file))
 }
 
 pub fn cleanup(session: &str) -> Result<()> {
@@ -1024,6 +1026,8 @@ impl Connection {
         let mut progress = Instant::now();
         let mut reported = progress;
         let mut bytes = [0; 16 * 1024];
+        // The end of what it printed, for the reason it failed.
+        let mut tail = Vec::new();
         let result = (|| -> Result<()> {
             loop {
                 self.check()?;
@@ -1036,6 +1040,8 @@ impl Connection {
                     Ok(0) => {}
                     Ok(n) => {
                         std::io::stderr().write_all(&bytes[..n])?;
+                        tail.extend_from_slice(&bytes[..n]);
+                        tail.drain(..tail.len().saturating_sub(4096));
                         progress = Instant::now();
                         if progress.duration_since(reported) >= timeout.min(Duration::from_secs(1)) / 2 {
                             self.send(FromClient::Progress)?;
@@ -1061,9 +1067,14 @@ impl Connection {
             return Err(error);
         }
         let status = child.wait()?;
+        let tail = String::from_utf8_lossy(&tail);
+        // Its last lines: kraal's own summary comes after what failed under it.
+        let lines: Vec<&str> = tail.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).collect();
+        let why = lines[lines.len().saturating_sub(3)..].join(" / ");
         ensure!(
             status.success(),
-            "copy was not fully installed. Check the destination and any staging path reported above, then retry from the file manager"
+            "copy was not fully installed ({}). Check the destination and any staging path reported above, then retry from the file manager",
+            if why.is_empty() { "no message" } else { &why }
         );
         Ok(())
     }
@@ -1863,6 +1874,28 @@ mod tests {
         assert!(r.receive(Packet::Chunk("invalid base64".into())).is_err());
         assert!(r.receive(Packet::End).is_err());
         assert!(!r.done);
+    }
+
+    #[test]
+    fn receiving_bounds_the_path_and_link_bytes_it_keeps() {
+        let spool = TempDir::new("copy-retained");
+        let dest = TempDir::new("copy-retained-dest");
+        let mut r = Receiver::new(spool.0.clone(), &spec(&spool, &dest, "dir")).unwrap();
+        r.receive(Packet::Begin { bytes: 0, entries: ENTRIES }).unwrap();
+        let mut parent = "dir".to_owned();
+        while parent.len() < 15 * 1024 {
+            r.receive(entry(&parent, Kind::Directory, 0)).unwrap();
+            r.receive(Packet::End).unwrap();
+            parent = format!("{parent}/{}", "d".repeat(255));
+        }
+        parent.truncate(parent.rfind('/').unwrap());
+        let error = (0..RETAINED / (15 * 1024))
+            .find_map(|i| {
+                let path = format!("{parent}/{i:0>255}");
+                r.receive(entry(&path, Kind::File, 0)).and_then(|_| r.receive(Packet::End)).err()
+            })
+            .expect("long paths must hit the budget well before 100,000 entries");
+        assert!(error.to_string().contains("exceed 64 MiB"), "{error:#}");
     }
 
     #[test]

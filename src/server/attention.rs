@@ -70,8 +70,21 @@ impl Server {
     /// (mode 1004), and each client's terminal reports pointer motion while the full sidebar has
     /// accounts or the pane it shows asks for it (mode 1003). A pane has the focus while an
     /// attached client whose terminal has the focus shows it. Each terminal's keyboard level
-    /// follows its client's mode too ([`Server::follow_keyboard`]).
+    /// follows its client's mode too ([`Server::follow_keyboard`]). The panes of a tab shown lose
+    /// their bell: the tab bar marks one that rang while nobody looked.
     pub(super) fn follow_focus(&mut self) {
+        let seen: Vec<PaneId> = self
+            .clients
+            .values()
+            .filter(|c| c.attached)
+            .filter_map(|c| self.workspaces[self.ws_index(c.workspace)?].tab())
+            .flat_map(|t| t.panes())
+            .collect();
+        for p in seen {
+            if let Some(p) = self.panes.get_mut(&p) {
+                p.bell = false;
+            }
+        }
         let shown = || {
             self.clients.values().filter(|c| c.attached && c.terminal_focused).filter_map(|c| self.client_focus(c.id))
         };
@@ -130,7 +143,7 @@ impl Server {
         if let Some(p) = self.panes.get_mut(&pane)
             && p.input_modes().focus_events
         {
-            p.write_input(if gained { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });
+            p.write_program(if gained { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });
         }
     }
 
@@ -427,6 +440,14 @@ impl Server {
             }
             return;
         }
+        // A remote client opens only web links (see client.rs): another one is copied instead.
+        if remote && !crate::pane::web_link(url) {
+            self.copy_to_client(client, url);
+            if self.buffers.get(Some("0")).is_ok_and(|buffer| buffer.text == url) {
+                self.toast(client, NoticeKind::Warning, format!("{url} is not a web link: kept in paste buffers"));
+            }
+            return;
+        }
         self.send_msg(client, &crate::protocol::ServerMsg::Open { url: url.to_string() });
         self.toast(client, NoticeKind::Notice, format!("opening {url}"));
     }
@@ -470,6 +491,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bell_is_marked_until_its_tab_is_shown() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        let (client, _peer) = client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let mut tab = || {
+            let spec = crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() };
+            server.spawn_pane_in(ws, None, spec, crate::protocol::Placement::Tab, None).unwrap()
+        };
+        let (rang, other) = (tab(), tab());
+        server.panes.get_mut(&rang).unwrap().bell = true;
+        server.follow_focus();
+        assert!(server.panes[&rang].bell, "its tab is not shown");
+        server.reveal(client, rang);
+        server.follow_focus();
+        server.reveal(client, other);
+        server.follow_focus();
+        assert!(!server.panes[&rang].bell, "it was seen");
+    }
+
+    #[test]
     fn a_remote_loopback_link_reports_the_buffer_it_kept() {
         let (tx, _rx) = queue::channel(16);
         let mut server = server(tx);
@@ -480,6 +522,19 @@ mod tests {
         assert_eq!(server.buffers.get(None).unwrap().text, url);
         let message = &server.clients[&id].toast.as_ref().unwrap().0;
         assert!(message.contains("kept in paste buffers (open it there, or ssh -L)"), "{message}");
+    }
+
+    #[test]
+    fn a_remote_client_is_given_a_link_that_is_not_web_as_a_copy() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        server.clients.get_mut(&id).unwrap().remote = true;
+        let url = "file:///Users/me/run.command";
+        server.open_for(id, url);
+        assert_eq!(server.buffers.get(None).unwrap().text, url);
+        let message = &server.clients[&id].toast.as_ref().unwrap().0;
+        assert_eq!(message, &format!("{url} is not a web link: kept in paste buffers"));
     }
 
     #[test]

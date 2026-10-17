@@ -1114,6 +1114,25 @@ fn accounts_add_adopts_a_verified_home_and_aliases_do_not_add_an_account() {
     }
 }
 
+/// `accounts rm` keeps the directory: adding the name again says that it reuses its sign-in.
+#[test]
+fn accounts_add_says_it_reuses_a_forgotten_accounts_sign_in() {
+    let env = Env::new("re-add");
+    let path = existing_sign_in_agent(&env, "claude");
+    let run = |args: &[&str]| {
+        let out = env.cmd(args).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    run(&["accounts", "add", "claude", "work", "--no-login"]);
+    std::fs::write(env.root.join("home/.local/share/kraal/accounts/claude-work/status"), "0").unwrap();
+    run(&["accounts", "rm", "claude:work"]);
+    let out = run(&["accounts", "add", "claude", "work"]);
+    assert!(out.contains("reusing the sign-in already in ~/.local/share/kraal/accounts/claude-work"), "{out}");
+    assert!(out.contains("`kraal accounts login claude:work` signs in again"), "{out}");
+    assert!(!env.root.join("home/logins").exists());
+}
+
 #[test]
 fn accounts_add_checks_the_home_chosen_by_review() {
     for signed_in in [false, true] {

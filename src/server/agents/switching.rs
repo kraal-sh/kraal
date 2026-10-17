@@ -135,6 +135,12 @@ impl AccountSwitches {
         }
     }
 
+    /// Whether a pending change already goes to `to`'s home: no Claude conversation moves into a
+    /// home where an agent runs, so a second change there would fail after stopping its source.
+    pub(in crate::server) fn reserved(&self, to: &Account) -> bool {
+        conversations_move(&to.agent) && self.pending.values().any(|s| s.to.same_home(to))
+    }
+
     fn reserve(&mut self, pane: PaneId, switch: AccountSwitch) {
         self.pending.insert(pane, switch);
     }
@@ -255,6 +261,9 @@ impl Server {
             return Ok(());
         }
         anyhow::ensure!(!self.switches.contains(pane), "an account change is already pending for this pane");
+        // A closed pane's change reserves nothing, though the periodic check has not dropped it yet.
+        self.switches.retain_panes(|p| self.panes.contains_key(&p));
+        anyhow::ensure!(!self.switches.reserved(to), "another pane is already changing to {}", accounts::label(to));
         anyhow::ensure!(!self.pane_edits.contains_key(&pane), "a pane edit is already being applied");
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
         let mut original = match &observed {
@@ -363,12 +372,7 @@ impl Server {
     fn switch_conversation(&self, pane: PaneId) -> Result<ConversationCheck> {
         let switch = self.switches.get(&pane).context("no pending account change")?;
         let p = self.panes.get(&pane).context("the pane was closed")?;
-        let same_process = match (&switch.process, p.process_hold()) {
-            (Some(before), Some(now)) => before.is(&now),
-            (None, None) => true,
-            _ => false,
-        };
-        anyhow::ensure!(same_process, "the pane's process changed; choose an account again");
+        anyhow::ensure!(self.switch_process_current(pane), "the pane's process changed; choose an account again");
         if let Some(observed) = &switch.observed {
             anyhow::ensure!(
                 self.observed_agent(pane)?.as_ref() == Some(observed),
@@ -446,28 +450,25 @@ impl Server {
                 self.switch_conversation(pane)? == check,
                 "the conversation or accounts changed; choose an account again"
             );
-            self.prepare_verified_switch(pane, approved)
+            self.prepare_verified_switch(pane, approved, check.session)
         });
         if let Err(e) = result {
             self.switch_failed(pane, &format!("{e:#}. The current pane is unchanged."), false);
         }
     }
 
-    fn prepare_verified_switch(&mut self, pane: PaneId, approved: bool) -> Result<()> {
+    fn prepare_verified_switch(&mut self, pane: PaneId, approved: bool, session: Option<String>) -> Result<()> {
         let switch = self.switches.get(&pane).context("no pending account change")?;
         let p = self.panes.get(&pane).context("the pane was closed")?;
         let to = switch.to.clone();
-        let session = if switch.observed.is_some() {
-            switch.original.session.clone()
-        } else {
-            p.agent.session_id.clone().or_else(|| switch.original.session.clone())
-        };
         let hooked = p.agent.hooked
             && switch.observed.as_ref().is_none_or(|a| p.agent.session_process == Some((a.pid, a.started)));
         let timing = switch_timing(hooked, p.agent.state, p.exit_code.is_some());
+        // An automatic change asks instead once someone has used the pane, even during the checks.
+        let attended = switch.client.is_none() && !self.unattended(pane);
         let stage = if approved {
             SwitchStage::Stopping
-        } else if switch.ask || !conversations_move(&to.agent) && timing == SwitchStage::Stopping {
+        } else if switch.ask || (attended || !conversations_move(&to.agent)) && timing == SwitchStage::Stopping {
             SwitchStage::Confirm
         } else {
             timing
@@ -815,14 +816,10 @@ impl Server {
         }
         let Some(switch) = self.switches.get(&pane) else { return };
         if matches!(switch.stage, SwitchStage::Restoring | SwitchStage::RecoveryStopping) {
-            self.switch_recovery_failed(pane, reason);
+            self.check_switch_recovery(pane, reason, false);
             return;
         }
         self.check_switch_recovery(pane, reason, true);
-    }
-
-    fn switch_recovery_failed(&mut self, pane: PaneId, reason: &str) {
-        self.check_switch_recovery(pane, reason, false);
     }
 
     fn check_switch_recovery(&mut self, pane: PaneId, reason: &str, retry: bool) {
@@ -873,7 +870,7 @@ impl Server {
         if retry && exact && current {
             self.switches.restore(pane);
             if let Err(e) = self.start_switch_spec(pane, spec) {
-                self.switch_recovery_failed(pane, &format!("{e:#}"));
+                self.check_switch_recovery(pane, &format!("{e:#}"), false);
             }
             self.mark_persist();
             self.relayout();

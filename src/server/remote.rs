@@ -79,10 +79,10 @@ struct Listed {
 }
 
 /// Text from a server, safe to draw: control characters made visible, formatting ones (bidi
-/// overrides, zero-width characters) dropped, cut to `max` columns.
+/// overrides, zero-width spaces: [`crate::text::invisible`]) dropped, cut to `max` columns.
 fn clean(text: &str, max: usize) -> String {
-    let invisible = |c: &char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}');
-    let text: String = text.chars().filter(|c| !invisible(c)).take(max * 4).map(crate::text::visible_char).collect();
+    let text: String =
+        text.chars().filter(|c| !crate::text::invisible(*c)).take(max * 4).map(crate::text::visible_char).collect();
     crate::text::truncate(text.trim(), max)
 }
 
@@ -469,7 +469,7 @@ impl Server {
                 // Asked through that tab, of the client in it: another one attached to that
                 // session (a terminal elsewhere) keeps what it shows.
                 Some(t) if t.attachment().is_some_and(|a| a.reports) => {
-                    t.write_input(format!("\x1b]7701;show;{pane}\x07").into_bytes());
+                    t.write_program(format!("\x1b]7701;show;{pane}\x07").into_bytes());
                 }
                 _ => self.focus_remote(client, &target, &session, pane),
             }

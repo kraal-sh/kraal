@@ -80,7 +80,7 @@ fn consent_opened_during_a_paste_cannot_allow_or_remember_it() {
             attachments.input(b"");
             nothing(&mut peer);
             let state = client.state.lock().unwrap();
-            assert_eq!(state.prompt.as_ref().unwrap().selected, 0, "split {split}");
+            assert_eq!(state.prompt.as_ref().unwrap().selected, 2, "split {split}");
             assert!(!state.allowed && !state.busy);
             drop(state);
             assert!(!permissions.exists());
@@ -103,7 +103,7 @@ fn listing_requires_consent_always_survives_attach_and_removal_revokes_it() {
     }
     let dir = TempDir::new("laptop-consent");
     let permissions = dir.0.join("laptop-files.toml");
-    let home = dirs::home_dir().unwrap();
+    let home = crate::paths::home_dir().unwrap();
     std::fs::write(home.join("laptop-visible.txt"), "visible").unwrap();
     let (client, mut peer) = controller(permissions.clone());
     client.request(1, Side::Left, 1, "~".into());
@@ -117,7 +117,7 @@ fn listing_requires_consent_always_survives_attach_and_removal_revokes_it() {
     assert!(!permissions.exists());
     client.request(1, Side::Left, 2, "~".into());
     nothing(&mut peer);
-    client.input(b"\t\r");
+    client.input(b"\x1b[Z\r");
     assert!(result(&mut peer).unwrap().1.iter().any(|e| e.name == "laptop-visible.txt"));
     assert!(permissions.exists());
     assert!(!client.state.lock().unwrap().allowed);
@@ -129,7 +129,7 @@ fn listing_requires_consent_always_survives_attach_and_removal_revokes_it() {
     next.request(1, Side::Left, 4, "~".into());
     nothing(&mut next_peer);
     assert!(next.state.lock().unwrap().prompt.is_some());
-    next.input(b"\r");
+    next.input(b"\t\r");
     assert!(result(&mut next_peer).is_ok());
     assert!(!permissions.exists());
     next.disconnect();
@@ -170,7 +170,7 @@ fn legacy_listing_grant_requires_fresh_consent_before_copying() {
     // Remember the expanded permission through the local prompt, then attach again.
     client.request(1, Side::Left, 1, "~".into());
     nothing(&mut peer);
-    client.input(b"\t\r");
+    client.input(b"\x1b[Z\r");
     assert!(result(&mut peer).is_ok());
     assert!(paste::allowed(&permissions, ssh), "the old listing grant is retained");
     assert!(paste::laptop_allowed(&permissions, ssh));
@@ -292,7 +292,7 @@ fn always_that_cannot_be_saved_lists_nothing_and_can_be_retried() {
     let (client, mut peer) = controller(dir.0.clone());
     client.request(1, Side::Left, 1, "~".into());
     nothing(&mut peer);
-    client.input(b"\t\r");
+    client.input(b"\x1b[Z\r");
     assert!(result(&mut peer).unwrap_err().contains("Cannot save laptop permission"));
     let state = client.state.lock().unwrap();
     assert!(!state.busy && !state.allowed && state.prompt.is_none());
@@ -300,6 +300,18 @@ fn always_that_cannot_be_saved_lists_nothing_and_can_be_retried() {
     client.request(1, Side::Left, 2, "~".into());
     nothing(&mut peer);
     assert!(client.state.lock().unwrap().prompt.is_some());
+}
+
+#[test]
+fn enter_typed_as_an_unasked_question_opens_refuses() {
+    let dir = TempDir::new("laptop-enter-refuses");
+    let permissions = dir.0.join("laptop-files.toml");
+    let (client, mut peer) = controller(permissions.clone());
+    client.request(1, Side::Left, 1, "~".into());
+    client.input(b"\r");
+    assert!(result(&mut peer).unwrap_err().contains("refused: nothing was listed"));
+    assert!(!client.state.lock().unwrap().allowed);
+    assert!(!permissions.exists());
 }
 #[test]
 fn sending_a_listing_does_not_hold_local_input_or_disconnect() {
@@ -526,7 +538,7 @@ fn reconnecting_two_laptop_panels_queues_the_second_until_the_first_finishes() {
         return;
     }
     let dir = TempDir::new("laptop-two-panels");
-    let home = dirs::home_dir().unwrap();
+    let home = crate::paths::home_dir().unwrap();
     for i in 0..100 {
         std::fs::write(home.join(format!("entry-{i}")), "x").unwrap();
     }
@@ -632,6 +644,34 @@ fn queued_requests_recheck_permission_and_disconnect_discards_the_queue() {
     client.next();
     assert!(result(&mut peer).unwrap_err().contains("off"));
 }
+#[test]
+fn a_flood_behind_an_open_question_stays_bounded_and_is_refused_at_once() {
+    let dir = TempDir::new("laptop-flood");
+    let (client, peer) = controller(dir.0.join("laptop-files.toml"));
+    client.request(1, Side::Left, 1, "~".into());
+    assert!(client.state.lock().unwrap().prompt.is_some());
+    for request in 2..100 {
+        client.request(1, Side::Right, request, "~".into());
+    }
+    assert_eq!(client.state.lock().unwrap().queued.len(), 1, "a newer listing of a panel replaces the queued one");
+    client.request(2, Side::Left, 1, "x".repeat(QUEUED_BYTES));
+    for token in 0..100 {
+        client.copy_message(format!("{token:x}"), ToClient::Start { sources: vec!["~/file".into()] });
+    }
+    assert_eq!(client.state.lock().unwrap().queued.len(), QUEUED);
+    let bytes = std::mem::take(&mut *peer.0.lock().unwrap());
+    let mut input = bytes.as_slice();
+    let (mut listings, mut copies) = (0, 0);
+    while let Some((_, payload)) = protocol::read_frame(&mut input).unwrap() {
+        match serde_json::from_slice(&payload).unwrap() {
+            ClientMsg::LaptopListed { pane: 2, result: Err(e), .. } if e.contains("Too many") => listings += 1,
+            ClientMsg::LaptopCopy { message: FromClient::Finish(Err(e)), .. } if e.contains("Too many") => copies += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!((listings, copies), (1, 100 - (QUEUED - 1)));
+}
+
 fn copy_packet(peer: &mut impl std::io::Read) -> (String, FromClient) {
     loop {
         let (_, bytes) = protocol::read_frame(peer).unwrap().unwrap();
@@ -685,7 +725,7 @@ fn copy_waits_for_total_ack_then_windows_data_without_blocking_input_and_disconn
         return;
     }
     let dir = TempDir::new("copy-window");
-    std::fs::write(dirs::home_dir().unwrap().join("large"), vec![0; copy::CHUNK * 10]).unwrap();
+    std::fs::write(crate::paths::home_dir().unwrap().join("large"), vec![0; copy::CHUNK * 10]).unwrap();
     let (client, mut next) = controller(dir.0.join("laptop-files.toml"));
     let mut peer = pipe_peer(&client);
     client.state.lock().unwrap().allowed = true;
@@ -732,7 +772,7 @@ fn delete_and_move_away_always_ask_locally_and_default_to_cancel() {
         return;
     }
     let dir = TempDir::new("laptop-destructive-consent");
-    let home = dirs::home_dir().unwrap();
+    let home = crate::paths::home_dir().unwrap();
     let path = home.join("report");
     std::fs::write(&path, "original").unwrap();
     for operation in [Operation::Move, Operation::Delete] {
@@ -791,7 +831,7 @@ fn confirmed_delete_removes_items_and_asks_again_even_after_allow() {
     let (client, _) = controller(dir.0.join("laptop-files.toml"));
     client.state.lock().unwrap().allowed = true;
     let mut peer = pipe_peer(&client);
-    let path = dirs::home_dir().unwrap().join("report");
+    let path = crate::paths::home_dir().unwrap().join("report");
     for token in ["abc", "def"] {
         std::fs::write(&path, "original").unwrap();
         client.copy_message(token.into(), ToClient::Delete { sources: vec!["~/report".into()] });
@@ -813,7 +853,7 @@ fn move_away_waits_for_installation_and_keeps_changed_or_cancelled_sources() {
         return;
     }
     let dir = TempDir::new("laptop-move");
-    let path = dirs::home_dir().unwrap().join("report");
+    let path = crate::paths::home_dir().unwrap().join("report");
     for outcome in ["success", "changed", "failed", "disconnect", "premature"] {
         std::fs::write(&path, "original").unwrap();
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
@@ -937,7 +977,7 @@ fn incoming_copy_replacement_always_asks_locally_and_cancel_writes_nothing() {
     }
     for operation in [Operation::Copy, Operation::Move] {
         let dir = TempDir::new("laptop-write-consent");
-        let home = dirs::home_dir().unwrap();
+        let home = crate::paths::home_dir().unwrap();
         std::fs::write(home.join("report"), "old").unwrap();
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         let (ssh, label) = client.destination.as_ref().unwrap();
@@ -994,7 +1034,7 @@ fn incoming_copy_receives_only_after_preparation_and_finishes_without_server_app
         return;
     }
     for operation in [Operation::Copy, Operation::Move] {
-        let path = dirs::home_dir().unwrap().join("report");
+        let path = crate::paths::home_dir().unwrap().join("report");
         let _ = std::fs::remove_file(&path);
         let dir = TempDir::new("laptop-write");
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
@@ -1032,7 +1072,7 @@ fn incoming_copy_receives_only_after_preparation_and_finishes_without_server_app
             assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(received) if received == sequence as u64));
         }
         assert!(matches!(copy_packet(&mut peer).1, FromClient::Finish(Ok(()))));
-        assert_eq!(std::fs::read(dirs::home_dir().unwrap().join("report")).unwrap(), b"abc");
+        assert_eq!(std::fs::read(crate::paths::home_dir().unwrap().join("report")).unwrap(), b"abc");
         client.copy_message("abc".into(), ToClient::Finish(Ok(())));
         assert_eq!(
             client.state.lock().unwrap().notice.as_ref().unwrap().1,
@@ -1048,7 +1088,7 @@ fn incoming_partial_copy_disconnect_and_premature_success_remove_staging() {
         return;
     }
     let dir = TempDir::new("laptop-write-interrupted");
-    let home = dirs::home_dir().unwrap();
+    let home = crate::paths::home_dir().unwrap();
     for disconnect in [true, false] {
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         client.state.lock().unwrap().allowed = true;
@@ -1169,5 +1209,5 @@ fn a_remembered_read_grant_still_asks_before_writing_to_the_laptop() {
     assert!(client.state.lock().unwrap().prompt.as_ref().unwrap().replacement.is_none());
     client.input(b"\x03");
     assert!(matches!(copy_reply(&mut peer).1, FromClient::Finish(Err(_))));
-    assert!(!dirs::home_dir().unwrap().join("report").exists());
+    assert!(!crate::paths::home_dir().unwrap().join("report").exists());
 }

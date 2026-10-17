@@ -58,8 +58,12 @@ impl DefinitionScan {
 
 impl Definitions {
     pub(super) fn failed(&self) -> bool {
-        self.listed.iter().any(|(_, d)| d.is_err())
-            || self.sources.iter().any(|(_, s)| s.as_ref().is_err_and(|e| !super::workspace_sources::source_missing(e)))
+        use super::config_scan::retryable;
+        self.listed.iter().any(|(_, d)| d.as_ref().is_err_and(retryable))
+            || self
+                .sources
+                .iter()
+                .any(|(_, s)| s.as_ref().is_err_and(|e| retryable(e) && !super::workspace_sources::source_missing(e)))
     }
 }
 

@@ -230,7 +230,7 @@ And everywhere:
   large one takes its place in the pane at once, what follows it goes on, and it shows when it is
   decoded (a fraction of a second for the largest).
 - `[graphics] memory_mb` (256 by default) bounds the memory all panes keep for images, the data
-  of those still to decode included. A pane that adds an image past it loses its own oldest
+  of those still arriving in chunks or to decode included. A pane that adds an image past it loses its own oldest
   images, never another pane's, and the image is refused when it has none left to give up. A
   preview whose image does not fit in what is left draws it with half blocks. The
   images ready to draw as sixel take at most a quarter of that again. `enabled = false` turns
@@ -290,7 +290,8 @@ bracketed pastes never trigger a clipboard read. Each notice cause is shown at m
 attach, including across reconnects, and disappears after four seconds.
 
 **Attach clipboard image** remains available in the palette and pane menu, including in local
-sessions. It names the destination and asks for **Send** or **Cancel** before reading once.
+sessions. It names the destination and asks for **Send** or **Cancel**, with Cancel selected, before
+reading once.
 An optional `attach_clipboard_image` binding opens the same prompt. Only a local key press or
 confirmation can authorize reading the clipboard. Server focus updates cannot trigger a read,
 and nothing watches the clipboard between actions.
@@ -376,7 +377,8 @@ source originals and are cancelled by closing their transfer window.
 Permissions are in `~/.config/kraal/paste-files.toml` (or
 `$XDG_CONFIG_HOME/kraal/paste-files.toml`). Remove the matching `[[server]]` entry to revoke it,
 or remove that file to revoke all permissions. Revocation applies to the next paste without
-reattaching. An unreadable or malformed file never grants permission. The file holds destination
+reattaching. An unreadable or malformed file, or one that is not a regular file or is over
+1 MiB, never grants permission. The file holds destination
 names and SSH arguments, not file contents or pasted text.
 
 **Paste as text** preserves the original bytes, including quotes and escapes.

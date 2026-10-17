@@ -38,14 +38,14 @@ impl Controller {
                 if !crate::attachments::token_valid(&token) || sources.is_empty() || sources.len() > 100_000 {
                     return;
                 }
-                let mut state = self.state.lock().unwrap();
+                let state = self.state.lock().unwrap();
                 if state.copies.contains_key(&token)
                     || state.queued.iter().any(|r| r.copy.as_ref().is_some_and(|(t, _)| t == &token))
                     || state.prompt.as_ref().is_some_and(|p| p.request.copy.as_ref().is_some_and(|(t, _)| t == &token))
                 {
                     return;
                 }
-                state.queued.push_back(Request {
+                let request = Request {
                     to_laptop,
                     operation,
                     copy: Some((token, sources)),
@@ -53,9 +53,8 @@ impl Controller {
                     side: Side::Left,
                     request: 0,
                     path,
-                });
-                drop(state);
-                self.next();
+                };
+                self.enqueue(state, request);
             }
             ToClient::Ack(_) | ToClient::Data { .. } | ToClient::Installed | ToClient::Progress => {
                 if let Some(worker) = self.state.lock().unwrap().copies.get(&token)
@@ -189,7 +188,7 @@ impl Controller {
                     check()?;
                 }
                 if operation == Operation::Delete {
-                    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
+                    let home = crate::paths::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
                     let removal = copy::Removal::read(&sources, &home, scope, &mut check)
                         .context("Cannot inspect selected items: check them on the laptop before retrying")?;
                     removal.remove(check)
@@ -262,7 +261,8 @@ impl Controller {
         let retry = token.clone();
         let spawned = crate::threads::named("laptop-write").spawn(move || {
             let result = (|| -> Result<()> {
-                let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
+                let home =
+                    crate::paths::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
                 let spec = copy::Spec {
                     operation,
                     to_laptop: true,
@@ -401,7 +401,7 @@ impl Controller {
                 _ => bail!("Laptop copy stalled or disconnected: reconnect and retry the copy"),
             }
         };
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
+        let home = crate::paths::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
         copy::send(
             sources,
             &home,

@@ -329,7 +329,7 @@ impl Server {
             return self.deleted_workspace_picker().result(NoticeKind::Notice, "Workspace already restored");
         };
         let name = saved.workspace.name.clone();
-        if self.workspace_name_used(&name, None, None) {
+        if self.workspace_name_used(&name, None, None, &self.definitions()) {
             let base = format!("{name}-restored");
             let proposed = self.available_workspace_name(&base);
             let mut p = Prompt::new(
@@ -428,7 +428,11 @@ impl Server {
 
     pub(super) fn add_workspace_form(&self, id: ClientId, from: Option<&Picker>) -> WorkspacePrompt {
         let name = from.map(|p| p.query.trim()).filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(|| {
-            (1..).map(|n| format!("workspace-{n}")).find(|n| !self.workspace_name_used(n, None, None)).unwrap()
+            let definitions = self.definitions();
+            (1..)
+                .map(|n| format!("workspace-{n}"))
+                .find(|n| !self.workspace_name_used(n, None, None, &definitions))
+                .unwrap()
         });
         let mut p = Prompt::new("Add workspace", &name, WorkspaceForm::new(WorkspaceAction::New));
         let form = p.data.as_mut();
@@ -1773,6 +1777,21 @@ mod tests {
         assert_eq!(p.value, "workspace-1");
         server.new_workspace(p.value, None);
         assert_eq!(server.add_workspace_form(client, None).value, "workspace-2");
+    }
+
+    #[test]
+    fn add_reads_the_definitions_once_to_find_a_free_name() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let dir = crate::testing::TempDir::new("add-free-name");
+        for n in 1..=15 {
+            dir.write(&format!("workspace-{n}.kdl"), "layout { pane; }");
+        }
+        server.config.workspace_dirs.push(dir.text());
+        crate::workspace::SOURCE_SCANS.set(0);
+        assert_eq!(server.add_workspace_form(client, None).value, "workspace-16");
+        assert_eq!(crate::workspace::SOURCE_SCANS.get(), server.config.workspace_dirs().len());
     }
 
     #[test]

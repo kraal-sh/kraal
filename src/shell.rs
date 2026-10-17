@@ -30,7 +30,9 @@ pub fn sh_c(script: &str) -> String {
 pub fn printf_escape(s: &str, spaces: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_./:=,+@#()[]{}<>;&|*?~^".contains(&b) || (spaces && b == b' ') {
+        // Not `#`, brackets or braces: bash 3.2 (macOS's sh) mistakes them inside `"$(…)"` for
+        // the script's own (`${f##*/}` then `"$(x "$y")"` stops it with a syntax error).
+        if b.is_ascii_alphanumeric() || b"-_./:=,+@".contains(&b) || (spaces && b == b' ') {
             out.push(b as char);
         } else {
             out.push_str(&format!("\\{b:03o}"));
@@ -67,6 +69,19 @@ pub fn join(words: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a login shell, then sh's `"$(printf "…")"`, reads of a script: no mark bash 3.2 could
+    /// take for the script's own, and the script itself once printf has rebuilt it.
+    #[test]
+    fn scripts_travel_as_letters_digits_and_octal_escapes() {
+        let script = "o=$2/${f##*/}; [ \"$(dev \"$f\")\" != x ] && { echo '%s' >&2; } # (a) [b] <c> ;&|*?~^";
+        let line = sh_c(script);
+        let inner = line.strip_prefix("sh -c 'eval \"$(printf \"").unwrap().strip_suffix("\")\"'").unwrap();
+        assert!(inner.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,+@ \\".contains(c)), "{inner}");
+        assert_eq!(unwrap_sh_c(&line), script);
+        let out = std::process::Command::new("sh").args(["-c", &format!("printf \"{inner}\"")]).output().unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), script);
+    }
 
     #[test]
     fn quoting() {

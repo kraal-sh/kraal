@@ -234,7 +234,7 @@ impl ToolDef {
     /// Whether the tool can be offered here: enabled, and its program installed when it runs
     /// on this machine (on a server, kraal cannot know without connecting).
     pub fn installed(&self, ctx: &ToolContext) -> bool {
-        self.runs_remote(ctx) || self.program().is_none_or(|p| crate::transfer::have_program(&p))
+        self.runs_remote(ctx) || self.program().is_none_or(|p| crate::exec::have_program(&p))
     }
 
     /// The directory a tool must run in exists (a tool never runs somewhere else than asked).
@@ -518,8 +518,7 @@ mod tests {
             ..Default::default()
         };
         let local_ctx = ToolContext { secrets: vec![("TOKEN".into(), secret.into())], ..Default::default() };
-        let logins =
-            ["sh", "bash", "zsh", "fish", "tcsh", "csh"].into_iter().filter(|s| crate::transfer::have_program(s));
+        let logins = ["sh", "bash", "zsh", "fish", "tcsh", "csh"].into_iter().filter(|s| crate::exec::have_program(s));
         let runs = logins.map(|login| (Some(login), &remote_ctx)).chain([(None, &local_ctx)]);
         for (login, ctx) in runs {
             if let Some(login) = login {

@@ -36,6 +36,8 @@ pub struct Plan<'a> {
     pub timeout: Duration,
     /// Set to stop: nothing more starts, and what runs is killed (with its descendants).
     pub cancel: &'a AtomicBool,
+    /// Outcomes keep their output once `done` has seen it (else a big fleet's would pile up).
+    pub keep_output: bool,
 }
 
 /// Run `plan.command` on every server, `plan.parallel` at a time. `done` is called as each
@@ -64,8 +66,12 @@ fn run_all_with(ssh: &str, servers: Vec<Server>, plan: &Plan, done: &(dyn Fn(&Ou
                     args.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-T"].map(String::from));
                     args.push(server.destination());
                     args.push(plan.command.to_string());
-                    let outcome = run_one(ssh, &server.name, &args, plan.timeout, plan.cancel);
+                    let mut outcome = run_one(ssh, &server.name, &args, plan.timeout, plan.cancel);
                     done(&outcome);
+                    if !plan.keep_output {
+                        // Assigned, not cleared: their memory goes too.
+                        (outcome.stdout, outcome.stderr) = (String::new(), String::new());
+                    }
                     results.lock().unwrap().push(outcome);
                 }
             });
@@ -161,6 +167,7 @@ mod tests {
             parallel: 2,
             timeout: Duration::from_secs(10),
             cancel: &cancel,
+            keep_output: true,
         };
         let results = run_all_with(&fake.display().to_string(), vec![mk("a"), mk("b"), mk("bad")], &plan, &|o| {
             seen.lock().unwrap().push(o.server.clone())
@@ -174,6 +181,17 @@ mod tests {
         assert_eq!((bad.ok(), bad.code), (false, Some(3)));
         assert!(format_outcome(bad, false).contains("✗ exit 3 bad"));
         assert!(format_outcome(bad, false).contains("  oops"));
+        // Without `--json`, each output is printed as it arrives and not kept.
+        let servers: Vec<Server> = (0..20).map(|i| mk(&format!("host{i}"))).chain([mk("bad")]).collect();
+        let printed = Mutex::new(0);
+        let plan = Plan { keep_output: false, parallel: 4, ..plan };
+        let results = run_all_with(&fake.display().to_string(), servers, &plan, &|o| {
+            assert!(!o.stdout.is_empty() || !o.stderr.is_empty());
+            *printed.lock().unwrap() += 1;
+        });
+        assert_eq!((results.len(), *printed.lock().unwrap()), (21, 21));
+        assert!(results.iter().all(|o| o.stdout.capacity() == 0 && o.stderr.capacity() == 0), "{results:?}");
+        assert_eq!(results.iter().filter(|o| !o.ok()).map(|o| o.code).collect::<Vec<_>>(), [Some(3)]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -203,6 +221,7 @@ wait
             parallel: 2,
             timeout: Duration::from_secs(60),
             cancel: &cancel,
+            keep_output: true,
         };
         let start = Instant::now();
         let results = std::thread::scope(|s| {

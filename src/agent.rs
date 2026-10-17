@@ -226,6 +226,10 @@ pub struct AgentTracker {
     /// The process that ran the agent's last hook (its id and start time): the agent itself when
     /// it runs its hooks directly, as OpenCode's and Kilo's plugins do.
     pub reporter: Option<(u32, u64)>,
+    /// The user sent input to the pane since the agent last took a prompt: a draft may wait there
+    /// (Enter alone proves nothing: backslash Enter is a new line in Claude Code). Cleared by the
+    /// agent's prompt hook, or for agents without one, by going from waiting to working.
+    pub typed: bool,
 }
 
 impl Default for AgentTracker {
@@ -239,6 +243,7 @@ impl Default for AgentTracker {
             session_process: None,
             message: None,
             reporter: None,
+            typed: false,
         }
     }
 }
@@ -248,6 +253,13 @@ impl AgentTracker {
     pub fn set(&mut self, state: AgentState) -> bool {
         if self.state == state {
             return false;
+        }
+        // From waiting to working, an agent whose hooks do not say when it takes a prompt took
+        // one, the draft with it. Those that say are believed alone: another plugin's Stop hook
+        // can send a finished turn back to work, the draft still there.
+        let reports = self.hooked && self.kind.as_deref().is_some_and(hooks_report_prompts);
+        if state == AgentState::Working && matches!(self.state, AgentState::Done | AgentState::Idle) && !reports {
+            self.typed = false;
         }
         self.state = state;
         self.since = Instant::now();
@@ -386,12 +398,36 @@ pub fn hook_state(agent: &str, payload: &serde_json::Value, event: Option<&str>)
     })
 }
 
+/// Whether a hook `event` is an agent taking a prompt, the user's: what a draft at its input went
+/// with. Agents that have one say so through [`hooks_report_prompts`].
+pub fn hook_prompt(event: &str) -> bool {
+    matches!(event, "UserPromptSubmit" | "BeforeAgent" | "userPromptSubmitted" | "beforeSubmitPrompt")
+}
+
+/// Whether `agent`'s hooks have a [`hook_prompt`] event (see [`hook_state`]).
+pub fn hooks_report_prompts(agent: &str) -> bool {
+    matches!(agent, "claude" | "droid" | "codebuddy" | "qwen" | "gemini" | "kimi" | "copilot" | "cursor")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    /// A finished turn sent back to work by another plugin's Stop hook took no prompt: the draft
+    /// stays, until the agent's prompt hook; agents without one go by waiting then working.
+    #[test]
+    fn only_a_prompt_taken_clears_a_draft() {
+        assert!(hook_prompt("UserPromptSubmit") && hook_prompt("BeforeAgent") && !hook_prompt("PreToolUse"));
+        for (agent, cleared) in [("claude", false), ("codex", true)] {
+            let mut a = AgentTracker { hooked: true, kind: Some(agent.into()), typed: true, ..Default::default() };
+            a.set(AgentState::Done);
+            a.set(AgentState::Working);
+            assert_eq!(a.typed, !cleared, "{agent}");
+        }
     }
 
     /// README.md names four agents and counts the others; docs/agents.md counts them all.

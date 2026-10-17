@@ -317,7 +317,7 @@ impl Pane {
         if query.is_empty() || self.term().is_none() {
             return false;
         }
-        let pattern = regex_escape(query);
+        let pattern = regex::escape(query);
         let Ok(regex) = RegexSearch::new(&pattern) else { return false };
         // The archived history is searched as the emulator searches its own: smart case.
         let archived =
@@ -533,18 +533,6 @@ pub(super) struct SearchState {
     /// The same, for the archived lines.
     archived: regex::Regex,
     current: Option<Match>,
-}
-
-/// Escape regex metacharacters so a plain query matches literally.
-pub(super) fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "\\.+*?()|[]{}^$#&-~".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// A URL around character column `col` of `line`, if any.

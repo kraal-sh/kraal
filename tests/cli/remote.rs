@@ -203,6 +203,36 @@ fn server_inventory_and_copy_plans() {
     assert!(!env.run(&["servers"]).contains("bastion"));
 }
 
+/// A name allowed to be replaced is matched whole on a server, though it holds a newline or ends
+/// in a carriage return; the names next to it stay refused.
+#[cfg(unix)]
+#[test]
+fn a_copy_without_replacing_matches_odd_names_whole_on_a_server() {
+    let env = Env::new("odd-names");
+    let (_, path) = fake_ssh(&env, &env);
+    std::fs::write(env.root.join("config/kraal/servers.toml"), "[[server]]\nname='box'\nhost='names.invalid'\n")
+        .unwrap();
+    let (src, dest) = (env.root.join("src"), env.root.join("dest"));
+    for dir in [&src, &dest] {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in ["a\nb", "c\r", "a"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+    }
+    let cp = |names: &[&str], allowed: &[&str]| {
+        let mut c = env.cmd(&["cp", "--dry-run", "--no-replace"]);
+        c.args(allowed.iter().map(|a| format!("--allow={a}")));
+        c.args(names.iter().map(|n| src.join(n)));
+        c.arg(format!("box:{}/", dest.display()));
+        c.env("PATH", &path).output().unwrap()
+    };
+    let out = cp(&["a\nb", "c\r"], &["a\nb", "c\r"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = cp(&["a\nb", "a"], &["a\nb"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("already has a: nothing was copied"), "{err}");
+}
+
 /// The commands that write servers.toml and accounts.toml edit the file the user wrote: its
 /// comments, its order and the keys this kraal does not read are there after each of them.
 #[test]
@@ -436,7 +466,7 @@ fn an_ssh_pane_keeps_the_account_it_was_opened_with() {
     write_script(
         &bin.join("ssh"),
         &format!(
-            "#!/bin/sh\necho \"$*\" >> {}\nfor a; do cmd=$a; done\ncase $cmd in *' '*) exec sh -c \"$cmd\";; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nfor a; do cmd=$a; done\ncase $cmd in *' '*) exec sh -c \"$cmd\";; esac\nexit 0\n",
             log.display()
         ),
     );
@@ -1740,7 +1770,7 @@ fn clipboard_images_use_local_private_storage_and_host_attachment_transport() {
         }
         client.wait_for("Send reads the local clipboard once.");
         assert!(!log.exists(), "offering the action must not read the clipboard");
-        client.type_keys(b"\r");
+        client.type_keys(b"\t\r");
         client.wait_for(if remote { "Sent to box" } else { "Sent to this machine" });
         client.wait_for("clipboard.png");
         client.wait_for("(100%)");

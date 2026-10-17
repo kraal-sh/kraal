@@ -430,6 +430,32 @@ fn what_waits_to_be_prepared_counts_in_the_quota() {
 }
 
 #[test]
+fn unfinished_chunked_uploads_count_in_the_shared_quota() {
+    let s = Arc::new(Shared::new(true, 1000));
+    s.set_available(true);
+    let mut t = term(20, 6);
+    let first = format!("\x1b_Ga=t,i=1,f=32,s=100,v=100,m=1;{}\x1b\\", "A".repeat(400));
+    let more = format!("\x1b_Gm=1;{}\x1b\\", "A".repeat(400));
+    let mut panes: Vec<PaneGraphics> = (0..3).map(|_| PaneGraphics::new(s.clone())).collect();
+    assert!(feed(&mut panes[0], &mut t, first.as_bytes()).is_empty());
+    assert!(feed(&mut panes[0], &mut t, more.as_bytes()).is_empty());
+    assert_eq!(s.used(), 800);
+    // Other panes' uploads are refused past the quota, and what they sent goes.
+    for g in &mut panes[1..] {
+        assert_eq!(feed(g, &mut t, first.as_bytes()), b"\x1b_Gi=1;ENOSPC:image storage is full\x1b\\");
+        feed(g, &mut t, more.as_bytes());
+        assert_eq!(s.used(), 800);
+    }
+    // A deletion, or the pane closing, ends an upload and frees what it held.
+    feed(&mut panes[0], &mut t, b"\x1b_Ga=d\x1b\\");
+    assert_eq!(s.used(), 0);
+    feed(&mut panes[1], &mut t, first.as_bytes());
+    assert_eq!(s.used(), 400);
+    drop(panes);
+    assert_eq!(s.used(), 0);
+}
+
+#[test]
 fn a_part_of_a_picture_being_prepared_is_cut_once_it_is() {
     let mut g = PaneGraphics::new(shared(true));
     let mut t = term(80, 40);

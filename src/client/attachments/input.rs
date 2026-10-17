@@ -24,6 +24,15 @@ impl Dropped {
     }
 }
 
+/// A drop's token: this process and the time.
+fn new_token() -> String {
+    format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+    )
+}
+
 impl Controller {
     pub fn pending_keys(&self) -> bool {
         let state = self.state.lock().unwrap();
@@ -171,7 +180,7 @@ impl Controller {
                     }
                 }
                 paste::Part::Paste(text) => {
-                    let paths = std::str::from_utf8(&text).ok().and_then(crate::transfer::dropped_paths);
+                    let paths = std::str::from_utf8(&text).ok().and_then(super::transfer::dropped_paths);
                     let state = self.state.lock().unwrap();
                     if state.prompt.is_some() {
                         drop(state);
@@ -211,27 +220,8 @@ impl Controller {
         clipboard: Option<(crate::layout::PaneId, Vec<u8>)>,
     ) {
         let mut state = self.state.lock().unwrap();
-        let token = format!(
-            "{:x}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
-        );
-        state.dropped = Some(Dropped {
-            image: false,
-            shortcut: false,
-            token: token.clone(),
-            original: text.clone(),
-            paths,
-            target: String::new(),
-            limits: Default::default(),
-            broadcast: false,
-            ready: false,
-            result: false,
-            retry: false,
-            selected: 0,
-            scroll: 0,
-            error: None,
-        });
+        let token = new_token();
+        state.dropped = Some(Dropped { token: token.clone(), original: text.clone(), paths, ..Default::default() });
         state.status = None;
         state.success_until = None;
         let dismiss = state.result_token.take();
@@ -310,8 +300,7 @@ impl Controller {
             Ok(true) => {}
             Ok(false) => {
                 drop(state);
-                self.read_clipboard_text(raw.to_vec(), read_text.clone());
-                return true;
+                return self.read_clipboard_text(raw.to_vec(), focus, read_text.clone());
             }
             result => {
                 drop(state);
@@ -319,26 +308,13 @@ impl Controller {
                 return false;
             }
         }
-        let token = format!(
-            "{:x}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
-        );
+        let token = new_token();
         state.dropped = Some(Dropped {
             image: true,
             shortcut: true,
             token: token.clone(),
             original: raw.to_vec(),
-            paths: Vec::new(),
-            target: String::new(),
-            limits: Default::default(),
-            broadcast: false,
-            ready: false,
-            result: false,
-            retry: false,
-            selected: 0,
-            scroll: 0,
-            error: None,
+            ..Default::default()
         });
         state.status = None;
         state.success_until = None;
@@ -388,11 +364,15 @@ impl Controller {
     fn read_clipboard_text(
         self: &Arc<Self>,
         key: Vec<u8>,
+        focus: Option<(Option<crate::layout::PaneId>, bool)>,
         read: impl FnOnce(&std::sync::atomic::AtomicBool, usize) -> Result<Vec<u8>> + Send + 'static,
-    ) {
+    ) -> bool {
         use std::sync::atomic::AtomicBool;
         let mut state = self.state.lock().unwrap();
-        let focus = state.focus;
+        // The server may have moved the focus since the offer checked it.
+        if state.focus != focus {
+            return false;
+        }
         let limit = state.clipboard_limit.unwrap_or(1024 * 1024).min(crate::clipboard::MAX_BYTES);
         let cancelled = Arc::new(AtomicBool::new(false));
         state.clipboard_read = Some(super::ClipboardRead {
@@ -425,6 +405,7 @@ impl Controller {
             self.state.lock().unwrap().clipboard_read = None;
             self.image_notice(Diagnostic::Failed(error.to_string()));
         }
+        true
     }
 
     fn finish_clipboard_text(self: &Arc<Self>) {
@@ -452,9 +433,9 @@ impl Controller {
             }
             Ok(bytes) if bytes.is_empty() => self.image_notice(Diagnostic::Empty),
             Ok(bytes) => {
-                let pane = pending.focus.and_then(|(pane, _)| pane).unwrap();
+                let Some(pane) = pending.focus.and_then(|(pane, _)| pane) else { return };
                 let paths = (self.remote && bytes.len() <= paste::LIMIT)
-                    .then(|| std::str::from_utf8(&bytes).ok().and_then(crate::transfer::dropped_paths))
+                    .then(|| std::str::from_utf8(&bytes).ok().and_then(super::transfer::dropped_paths))
                     .flatten();
                 if let Some(paths) = paths {
                     self.request_pasted_paths(bytes, paths, Some((pane, pending.key)));
@@ -782,11 +763,7 @@ impl Controller {
                 return;
             }
             // A retry reserves the current pane again and shows it before anything is sent.
-            dropped.token = format!(
-                "{:x}-{:x}",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
-            );
+            dropped.token = new_token();
             dropped.result = false;
             dropped.ready = false;
             dropped.selected = 0;

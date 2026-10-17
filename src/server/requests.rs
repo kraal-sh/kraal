@@ -382,20 +382,39 @@ impl Server {
             Request::ReadPane { pane, lines } => {
                 self.resolve(&pane).map(|p| Response::Text(self.panes[&p].text(lines)))
             }
-            Request::AgentReport { pane, agent, state, session_id, message } => self.resolve(&pane).map(|p| {
+            Request::AgentReport { pane, agent, state, session_id, message, prompt } => self.resolve(&pane).map(|p| {
                 // Some agents run other agents' hooks (Cursor and Continue run Claude Code's):
                 // a report that names another agent than the one running here is not about it.
                 let running = self.panes[&p].foreground_argv().as_deref().and_then(crate::agent::detect_agent);
                 if running.is_some_and(|r| r != agent) {
                     return Response::Ok;
                 }
-                // The hook's parent: the agent itself when it runs its hooks directly.
+                // The agent that ran the hook: its nearest ancestor running that agent, past the
+                // shells that run hook commands; the hook's parent when kraal cannot tell.
                 let reporter = self
                     .clients
                     .get(&client)
                     .and_then(|c| c.peer)
                     .and_then(crate::process::ppid)
+                    .map(|parent| {
+                        crate::process::lineage(parent)
+                            .into_iter()
+                            .find(|pid| {
+                                crate::process::argv(*pid).as_deref().and_then(crate::agent::detect_agent)
+                                    == Some(agent.as_str())
+                            })
+                            .unwrap_or(parent)
+                    })
                     .and_then(|pid| Some((pid, crate::process::start_time(pid)?)));
+                // A run the pane's agent started (`claude -p` from its Bash tool) inherits the pane
+                // and the hooks: what it reports is not about the pane's agent.
+                if let (Some((known, started)), Some((pid, _))) = (self.panes[&p].agent.reporter, reporter)
+                    && pid != known
+                    && crate::process::lineage(pid).contains(&known)
+                    && crate::process::start_time(known) == Some(started)
+                {
+                    return Response::Ok;
+                }
                 let session_process = self.panes[&p].foreground_pid().and_then(|fg| {
                     let (reporter, _) = reporter?;
                     crate::process::lineage(reporter)
@@ -426,6 +445,9 @@ impl Server {
                     // was seen: a finished turn stays to be looked at.
                     if let Some(s) = state.filter(|s| !(*s == AgentState::Idle && a.state == AgentState::Done)) {
                         a.set(s);
+                    }
+                    if prompt {
+                        a.typed = false;
                     }
                     if message.is_some() {
                         a.message = message;
@@ -785,6 +807,68 @@ pub(super) mod tests {
         assert_eq!(server.warnings, ["before", "other job", "between", "target job"]);
         assert_eq!(server.jobs.len(), 1);
         assert!(matches!(rx.try_recv(), Ok(Event::Job(id, _)) if id == later));
+    }
+
+    /// `claude -p` from the agent's Bash tool inherits the pane and its hooks: its reports leave the
+    /// pane's conversation and state alone; the agent's own, from any hook shell, still count.
+    #[test]
+    fn a_nested_agent_run_does_not_take_over_the_panes_conversation() {
+        let dir = crate::testing::TempDir::new("nested-agent");
+        let claude = dir.0.join("claude");
+        // Each hook is a `sleep` whose pid lands in a file: the nested run's is its child, the
+        // agent's run in a shell of their own.
+        let script = "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n\
+            if [ \"$1\" = nested ]; then sleep 60 & echo $! > nested; wait; exit; fi\n\
+            for hook in start prompt; do sh -c 'sleep 60 & echo $! > \"$0\"; wait' $hook & done\n\
+            \"$0\" nested &\nwait\n";
+        crate::testing::write_script(&claude, script);
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        let (client, _peer) = client(&mut server);
+        let spec = PaneSpec { command: vec![claude.display().to_string()], ..Default::default() };
+        let pane = crate::pane::Pane::spawn(1, None, spec, 80, 24, &server.env, &server.tx).unwrap();
+        server.panes.insert(1, pane);
+        let deadline = Instant::now() + PATIENCE;
+        let hook = |name: &str| loop {
+            if let Some(pid) = crate::testing::read_complete_lines(dir.0.join(name)) {
+                return pid.trim().parse::<u32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "the {name} hook did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let (start, prompt, nested) = (hook("start"), hook("prompt"), hook("nested"));
+        let report = |server: &mut Server, peer: u32, state: AgentState, session: &str| {
+            server.clients.get_mut(&client).unwrap().peer = Some(peer);
+            let session_id = Some(session.to_string());
+            let req = Request::AgentReport {
+                pane: "1".into(),
+                agent: "claude".into(),
+                state: Some(state),
+                session_id,
+                message: None,
+                prompt: false,
+            };
+            server.request(client, req).immediate().unwrap();
+            let a = &server.panes[&1].agent;
+            (a.session_id.clone(), a.state, a.hooked)
+        };
+        assert_eq!(
+            report(&mut server, start, AgentState::Idle, "outer"),
+            (Some("outer".into()), AgentState::Idle, true)
+        );
+        for state in [AgentState::Idle, AgentState::Done, AgentState::Unknown] {
+            assert_eq!(
+                report(&mut server, nested, state, "nested"),
+                (Some("outer".into()), AgentState::Idle, true),
+                "{state:?} from the nested run"
+            );
+        }
+        assert_eq!(
+            report(&mut server, prompt, AgentState::Working, "cleared"),
+            (Some("cleared".into()), AgentState::Working, true),
+            "the agent's own hook, from another shell"
+        );
+        assert!(!report(&mut server, start, AgentState::Unknown, "cleared").2, "the agent's session ended");
     }
 
     fn files(server: &mut Server) -> PaneId {

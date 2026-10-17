@@ -265,6 +265,17 @@ impl Held {
         shared.used.fetch_add(data.len(), Ordering::Relaxed);
         Held { data, shared: shared.clone() }
     }
+
+    fn extend(&mut self, more: &[u8]) {
+        self.shared.used.fetch_add(more.len(), Ordering::Relaxed);
+        self.data.extend_from_slice(more);
+    }
+
+    /// The data, no longer counted: whoever takes it counts it again.
+    fn into_vec(mut self) -> Vec<u8> {
+        self.shared.used.fetch_sub(self.data.len(), Ordering::Relaxed);
+        std::mem::take(&mut self.data)
+    }
 }
 
 impl std::ops::Deref for Held {
@@ -345,10 +356,10 @@ impl Budget {
 
 const BUSY: &str = "EBUSY:too many images at once";
 
-/// A transmission arriving in chunks.
+/// A transmission arriving in chunks: what came so far counts in the quota.
 struct Pending {
     command: Command,
-    payload: Vec<u8>,
+    payload: Held,
 }
 
 /// Makes a picture's PNG: what is slow (decoding what the program sent, encoding it as PNG,
@@ -509,18 +520,25 @@ impl PaneGraphics {
             if pending.payload.len() + cmd.payload.len() > MAX_UPLOAD {
                 return Answer::Now(pending.command.reply(pending.command.id, "EFBIG:image too large".into()));
             }
-            pending.payload.extend_from_slice(&cmd.payload);
+            pending.payload.extend(&cmd.payload);
+            if let Err(e) = self.make_room() {
+                return Answer::Now(pending.command.reply(pending.command.id, e));
+            }
             if cmd.more {
                 self.pending = Some(pending);
                 return Answer::Now(None);
             }
             let mut command = pending.command;
-            command.payload = pending.payload;
+            command.payload = pending.payload.into_vec();
             return self.transmit(command, term);
         }
         match cmd.action.unwrap_or(b't') {
             b't' | b'T' | b'q' if cmd.more => {
-                self.pending = Some(Pending { payload: std::mem::take(&mut cmd.payload), command: cmd });
+                let payload = Held::new(std::mem::take(&mut cmd.payload), &self.shared);
+                if let Err(e) = self.make_room() {
+                    return Answer::Now(cmd.reply(cmd.id, e));
+                }
+                self.pending = Some(Pending { payload, command: cmd });
                 Answer::Now(None)
             }
             b't' | b'T' | b'q' => self.transmit(cmd, term),
@@ -803,9 +821,9 @@ impl PaneGraphics {
         self.shared.changed();
     }
 
-    /// Keep the images of all panes, with what was sent for those still to prepare, within the
-    /// quota, the new one counted: this pane's oldest images go first. Another pane's images are
-    /// not this pane's to drop.
+    /// Keep the images of all panes, with what was sent for those still arriving or to prepare,
+    /// within the quota, the new one counted: this pane's oldest images go first. Another pane's
+    /// images are not this pane's to drop.
     fn make_room(&mut self) -> Result<(), String> {
         while self.shared.used() > self.shared.quota {
             let oldest_upload = self.uploads.iter().min_by_key(|(_, u)| u.stamp).map(|(id, u)| (u.stamp, *id));

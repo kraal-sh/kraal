@@ -6,10 +6,17 @@ use super::writes::file_id;
 /// Lock `file` exclusively, without waiting: false when another open file holds it. The lock
 /// goes when its last descriptor closes, including duplicates inherited by a forked child.
 pub(crate) fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    flock(file, false)
+}
+
+/// An exclusive flock(2) on `file`, waiting for it when `wait`: false when another open file
+/// holds it and `wait` is false.
+pub(crate) fn flock(file: &std::fs::File, wait: bool) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
+    let how = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
     loop {
         // SAFETY: flock on a descriptor we own.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), how) } == 0 {
             return Ok(true);
         }
         let e = std::io::Error::last_os_error();

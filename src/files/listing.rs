@@ -1,13 +1,13 @@
 //! Directory listings, local or over ssh, run on background threads.
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 use super::{Entry, Location, Remote};
-use crate::text::unix_seconds;
+use crate::text::{days_from_civil, unix_seconds};
 
 /// How long a remote listing may take before ssh is killed.
 pub(super) const SSH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -81,26 +81,11 @@ pub(super) fn list_local(path: &Path) -> Result<(PathBuf, Vec<Entry>), String> {
 
 /// Expands `~`, makes the path absolute and removes `.` and `..` components.
 pub(super) fn resolve_local(path: &Path) -> PathBuf {
-    let expanded = match (path.strip_prefix("~"), home_dir()) {
+    let expanded = match (path.strip_prefix("~"), crate::paths::home_dir()) {
         (Ok(rest), Some(home)) => home.join(rest),
         _ => path.to_path_buf(),
     };
-    let absolute = std::path::absolute(&expanded).unwrap_or(expanded);
-    let mut normal = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normal.pop();
-            }
-            other => normal.push(other.as_os_str()),
-        }
-    }
-    normal
-}
-
-pub(super) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|home| !home.is_empty()).map(PathBuf::from)
+    crate::paths::lexical(&std::path::absolute(&expanded).unwrap_or(expanded))
 }
 
 pub(super) fn list_remote(remote: &Remote, ssh: &Ssh, cancel: &AtomicBool) -> Result<(String, Vec<Entry>), String> {
@@ -303,17 +288,6 @@ pub(super) fn ls_time(month: &str, day: &str, time: &str, now: i64) -> Option<i6
         let year = time.parse::<i64>().ok().filter(|y| (0..=1_000_000).contains(y))?;
         Some(days_from_civil(year, month, day) * 86_400)
     }
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
-pub(super) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month = i64::from(month);
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 /// The date of a day count since 1970-01-01.

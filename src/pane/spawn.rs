@@ -208,8 +208,11 @@ mod native {
         pub(super) fn new(cmd: &CommandBuilder, tty: &Path) -> Result<Prepared> {
             let argv = cmd.get_argv();
             let exe = argv.first().context("no program to run")?;
-            let home =
-                cmd.get_env("HOME").map(PathBuf::from).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"));
+            let home = cmd
+                .get_env("HOME")
+                .map(PathBuf::from)
+                .or_else(crate::paths::home_dir)
+                .unwrap_or_else(|| PathBuf::from("/"));
             let dir = cmd.get_cwd().map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or(home);
             let program = find_program(exe, &dir, cmd.get_env("PATH"))?;
             let mut env: Vec<CString> = Vec::new();

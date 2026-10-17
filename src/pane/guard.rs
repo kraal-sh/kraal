@@ -12,6 +12,9 @@
 //! It also follows the scroll region's top margin on the primary screen, for the command marks:
 //! a region that starts below the first line scrolls without filling the history.
 //!
+//! And it cuts an OSC string longer than [`MAX_OSC`] with CAN: the parser keeps the whole of one
+//! in memory until it ends, and `printf '\e]'; cat big.log` never ends it.
+//!
 //! Only escape sequences matter, and ESC puts the parser in the same state whatever it was
 //! reading: so the parser is given each sequence from its ESC, and plain text, along with
 //! common sequences that can change none of this (colours, cursor moves), is skipped.
@@ -22,6 +25,9 @@ use alacritty_terminal::vte::{Params, Parser, Perform};
 
 /// Pushes beyond this depth are dropped (well below the emulator's 4096).
 const MAX_DEPTH: u32 = 1024;
+/// Longest OSC string the emulator is given: room for the largest copy kraal takes (OSC 52,
+/// in base64: 4/3 of it).
+const MAX_OSC: usize = crate::clipboard::MAX_BYTES * 3 / 2;
 /// Cancel: ends the sequence being read without acting on it, in any state.
 const CAN: u8 = 0x18;
 /// Substitute: ends it too.
@@ -42,6 +48,18 @@ pub(super) struct KeyboardStackGuard {
     /// The parser was given the end of the last read, a sequence it may still be reading: the
     /// next read goes to it up to its first ESC.
     unfinished: bool,
+    /// Where the parser is as to OSC strings, after what it was given.
+    osc: Osc,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum Osc {
+    #[default]
+    Out,
+    /// After an ESC, which a `]` makes an OSC string.
+    Esc,
+    /// In an OSC string, this long so far.
+    In(usize),
 }
 
 /// What the bytes from an ESC are, for the guard.
@@ -194,8 +212,10 @@ impl KeyboardStackGuard {
     /// refuses end. A push is dispatched on its final `u`: the bytes are read in runs, and each
     /// `u` alone, to know whether it is the one.
     fn read(&mut self, bytes: &[u8], offset: usize, refused: &mut Vec<usize>) {
+        let mut bytes = Cow::Borrowed(bytes);
+        self.cut_osc(&mut bytes, offset, refused);
         let mut start = 0;
-        for at in memchr::memchr_iter(b'u', bytes) {
+        for at in memchr::memchr_iter(b'u', &bytes) {
             self.read_run(&bytes[start..at]);
             self.parser.advance(&mut self.seen, b"u");
             if self.apply() {
@@ -204,6 +224,44 @@ impl KeyboardStackGuard {
             start = at + 1;
         }
         self.read_run(&bytes[start..]);
+    }
+
+    /// Follow `bytes` into and through OSC strings as the parser reads them, and turn the byte
+    /// past [`MAX_OSC`] of one into CAN, which ends it. The emulator acts on what it got: a copy
+    /// (OSC 52) cut so is longer than any kraal takes.
+    fn cut_osc(&mut self, bytes: &mut Cow<[u8]>, offset: usize, refused: &mut Vec<usize>) {
+        let mut at = 0;
+        while at < bytes.len() {
+            match self.osc {
+                Osc::Out => match memchr::memchr(ESC, &bytes[at..]) {
+                    Some(n) => (at, self.osc) = (at + n + 1, Osc::Esc),
+                    None => return,
+                },
+                Osc::Esc => {
+                    // Other controls, and bytes ESC ignores, leave it waiting.
+                    if !matches!(bytes[at], 0..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff) {
+                        self.osc = if bytes[at] == b']' { Osc::In(0) } else { Osc::Out };
+                    }
+                    at += 1;
+                }
+                Osc::In(len) => {
+                    let rest = &bytes[at..];
+                    let body = rest.iter().position(|b| matches!(*b, 0x07 | CAN | SUB | ESC)).unwrap_or(rest.len());
+                    if len + body > MAX_OSC {
+                        at += MAX_OSC - len;
+                        bytes.to_mut()[at] = CAN;
+                        refused.push(offset + at);
+                        self.osc = Osc::Out;
+                    } else if body < rest.len() {
+                        // Its end, read again as outside: an ESC starts the next sequence.
+                        (at, self.osc) = (at + body, Osc::Out);
+                    } else {
+                        self.osc = Osc::In(len + body);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn read_run(&mut self, bytes: &[u8]) {
@@ -306,6 +364,29 @@ mod tests {
         ] {
             assert_eq!(sequence(bytes), want, "{bytes:?}");
         }
+    }
+
+    /// An OSC string that never ends (`printf '\e]'; cat big.log`) is cut once it passes MAX_OSC,
+    /// across any number of reads: the emulator keeps no more of it, and shows what follows.
+    #[test]
+    fn an_endless_osc_string_is_cut() {
+        let size = super::super::pty::Size { cols: 20, rows: 5 };
+        let mut term = Term::new(Config::default(), &size, super::super::pty::Listener::default());
+        let mut parser: Processor = Processor::new();
+        let mut g = KeyboardStackGuard::default();
+        let text = vec![b'x'; 64 * 1024];
+        // ESC, then a control the parser passes over, then `]`, each in its own read.
+        let reads =
+            [&b"\x1b"[..], b"\0", b"]"].into_iter().chain(std::iter::repeat_n(&text[..], MAX_OSC / text.len() + 2));
+        let mut out = Vec::new();
+        for read in reads {
+            let read = g.filter(read);
+            parser.advance(&mut term, &read);
+            out.extend_from_slice(&read);
+        }
+        assert_eq!(memchr::memchr_iter(CAN, &out).collect::<Vec<_>>(), [3 + MAX_OSC]);
+        parser.advance(&mut term, &g.filter(b"\r\nshown"));
+        assert!(super::super::screen::lines_text(&term, 4, 5).starts_with("shown"));
     }
 
     /// The guard as it was: the parser reads every byte.

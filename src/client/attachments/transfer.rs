@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -36,7 +37,7 @@ impl Dropped {
 }
 
 pub(super) fn explicit_paths(text: &str) -> Result<Vec<std::path::PathBuf>> {
-    crate::transfer::dropped_paths(text).context("enter existing absolute paths, quoting spaces")
+    dropped_paths(text).context("enter existing absolute paths, quoting spaces")
 }
 
 impl Controller {
@@ -50,19 +51,13 @@ impl Controller {
         if state.dropped.is_none() {
             state.dropped = Some(Dropped {
                 image: prompt.image,
-                shortcut: false,
                 token: prompt.token.clone(),
                 original: prompt.text.as_bytes().to_vec(),
                 paths: if prompt.image { Vec::new() } else { explicit_paths(&prompt.text).unwrap_or_default() },
                 target: prompt.target.clone(),
                 limits: prompt.limits.clone(),
-                broadcast: false,
                 ready: true,
-                result: false,
-                retry: false,
-                selected: 0,
-                scroll: 0,
-                error: None,
+                ..Default::default()
             });
         }
         state.success_until = None;
@@ -239,4 +234,119 @@ impl Controller {
         write(ClientMsg::AttachmentFinish { token: token.clone() })?;
         Ok(())
     }
+}
+
+/// Recognize complete local path lists without expanding shell expressions.
+pub(super) fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
+    if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return None;
+    }
+    let text = text.trim();
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars().peekable();
+    let mut quote = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => {
+                let next = chars.next()?;
+                if !matches!(next, '"' | '\\' | '$' | '`') {
+                    cur.push('\\');
+                }
+                cur.push(next);
+            }
+            (Some('"') | None, '$' | '`') => return None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                cur.push(chars.next()?);
+                in_word = true;
+            }
+            (None, '*' | '?' | '[' | ']' | ';' | '|' | '&' | '<' | '>' | '(' | ')') => return None,
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(cur);
+    }
+    let parsed =
+        words.into_iter().map(|word| local_path(&word)).collect::<Option<Vec<_>>>().filter(|paths| !paths.is_empty());
+    // Some terminals leave spaces unquoted. Never choose between a whole name and a list.
+    let raw = (!text.contains(['\'', '"', '\\', '\n', '\r', '\t']))
+        .then(|| local_path(text))
+        .flatten()
+        .map(|path| vec![path]);
+    if parsed.is_some() {
+        let words: Vec<_> = text.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let start = word.as_ptr() as usize - text.as_ptr() as usize;
+            let Some(next) = words.get(i + 1) else { break };
+            let next_start = next.as_ptr() as usize - text.as_ptr() as usize;
+            // Joining absolute words would need a directory whose name includes the separator.
+            if !Path::new(&text[start..next_start]).is_dir() {
+                continue;
+            }
+            for last in &words[i + 1..] {
+                let last_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+                if last_end - start > 4096 {
+                    break;
+                }
+                let joined = &text[start..last_end];
+                if !joined.contains(['\'', '"', '\\', '\n', '\r', '\t']) && local_path(joined).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    match (parsed, raw) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(paths), _) | (_, Some(paths)) => Some(paths),
+        _ => None,
+    }
+}
+
+fn local_path(word: &str) -> Option<PathBuf> {
+    let decoded;
+    let word = if let Some(uri) = word.strip_prefix("file://") {
+        if !uri.starts_with('/') || uri.contains(['?', '#']) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        let mut input = uri.bytes();
+        while let Some(byte) = input.next() {
+            bytes.push(if byte == b'%' {
+                let hi = char::from(input.next()?).to_digit(16)?;
+                let lo = char::from(input.next()?).to_digit(16)?;
+                (hi * 16 + lo) as u8
+            } else {
+                byte
+            });
+        }
+        decoded = String::from_utf8(bytes).ok()?;
+        decoded.as_str()
+    } else {
+        word
+    };
+    if word.chars().any(char::is_control) {
+        return None;
+    }
+    let path = PathBuf::from(word);
+    (path.is_absolute() && std::fs::symlink_metadata(&path).is_ok()).then_some(path)
 }

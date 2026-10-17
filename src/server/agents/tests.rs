@@ -283,7 +283,7 @@ fn identity_discovery(name: &str) -> (SwitchTest, Account, PathBuf) {
     let work = t.server.accounts.get("claude", "work").unwrap();
     t.server.accounts.save().unwrap();
     t.server.account_discovery.checks.insert("codex".into(), ExistingCheck::Checked(Status::NotInstalled));
-    let standard = dirs::home_dir().unwrap().join(".claude");
+    let standard = crate::paths::home_dir().unwrap().join(".claude");
     std::fs::create_dir_all(&standard).unwrap();
     let bin = t.dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2141,5 +2141,184 @@ fn recovery_lookups_leave_the_server_free_to_handle_input() {
             assert!(t.server.switches.pending.is_empty());
             assert!(t.server.panes[&1].exit_code.is_some());
         }
+    }
+}
+
+#[test]
+fn auto_mode_stops_only_an_agent_whose_finished_turn_is_unseen() {
+    for watched in [false, true] {
+        let mut t = SwitchTest::new(&format!("auto-unseen-{watched}"));
+        t.server.switches.pending.clear();
+        t.server.accounts.limits.mode = LimitMode::Auto;
+        for (name, percent) in [("from", 95.0), ("to", 0.0)] {
+            let usage = accounts::Usage {
+                five_hour: Some(accounts::Window { used_percent: percent, resets_at: Some(accounts::now() + 3600) }),
+                ..Default::default()
+            };
+            t.server.usage.0.insert(t.server.accounts.get("claude", name).unwrap().key(), usage);
+        }
+        // Looked at or typed in: its prompt may hold a draft.
+        t.server.panes.get_mut(&1).unwrap().agent.state = AgentState::Idle;
+        t.server.check_limits();
+        assert!(t.server.switches.pending.is_empty());
+        t.server.panes.get_mut(&1).unwrap().agent.state = AgentState::Done;
+        t.server.check_limits();
+        let token = t.server.switches.pending[&1].token;
+        // Someone starts typing in it while the change is checked.
+        let _peer = watched.then(|| {
+            let (_, peer) = super::super::tests::client(&mut t.server);
+            let tab = &mut t.server.workspaces.last_mut().unwrap().tabs[0];
+            tab.root = Some(crate::layout::Node::Leaf(1));
+            tab.set_focus(1);
+            peer
+        });
+        t.server.switch_checked(1, token, Status::SignedIn, false);
+        t.conversation_jobs();
+        assert_eq!(t.server.switches.get(&1).map(|s| s.stage) == Some(SwitchStage::Stopping), !watched);
+    }
+}
+
+#[test]
+fn auto_mode_does_not_stop_an_agent_that_got_broadcast_input() {
+    for broadcast in [false, true] {
+        let mut t = SwitchTest::new(&format!("auto-broadcast-{broadcast}"));
+        t.server.switches.pending.clear();
+        t.server.accounts.limits.mode = LimitMode::Auto;
+        for (name, percent) in [("from", 95.0), ("to", 0.0)] {
+            let usage = accounts::Usage {
+                five_hour: Some(accounts::Window { used_percent: percent, resets_at: Some(accounts::now() + 3600) }),
+                ..Default::default()
+            };
+            t.server.usage.0.insert(t.server.accounts.get("claude", name).unwrap().key(), usage);
+        }
+        // The agent's pane (1) beside the one typed in (2), both running a program.
+        let agent = PaneSpec { text: None, ..t.server.panes[&1].spec.clone() };
+        for id in [1, 2] {
+            let read = PaneSpec { command: vec!["sh".into(), "-c".into(), "read line".into()], ..Default::default() };
+            let pane = crate::pane::Pane::spawn(id, None, read, 80, 24, &t.server.env, &t.server.tx).unwrap();
+            t.server.panes.insert(id, pane);
+        }
+        let p = t.server.panes.get_mut(&1).unwrap();
+        (p.spec, p.agent.hooked, p.agent.state) = (agent, true, AgentState::Done);
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let ws = t.server.workspaces.last_mut().unwrap();
+        ws.tabs[0].root = Some(crate::layout::Node::Stack { panes: vec![1, 2], open: 2 });
+        ws.tabs[0].set_focus(2);
+        if broadcast {
+            ws.sync = crate::server::SyncScope::Tab;
+        }
+        t.server.client_input(client, b"x");
+        t.server.check_limits();
+        let automatic = t.server.switches.get(&1).is_some_and(|s| s.client.is_none() && !s.ask);
+        assert_eq!(automatic, !broadcast, "a draft typed through a broadcast is not stopped");
+    }
+}
+
+#[test]
+fn a_usage_seen_on_screen_is_saved_without_waiting_on_the_loop() {
+    let mut t = SwitchTest::new("usage-lock");
+    t.server.switches.pending.clear();
+    let agent = PaneSpec { text: None, ..t.server.panes[&1].spec.clone() };
+    let say = "echo \"You've used 90% of your session limit\"; read line";
+    t.spawn(PaneSpec { command: vec!["sh".into(), "-c".into(), say.into()], ..Default::default() });
+    t.server.panes.get_mut(&1).unwrap().spec = agent;
+    t.until("the message shows", |t| t.server.panes[&1].live_text().contains("session limit"));
+    let from = t.server.accounts.get("claude", "from").unwrap();
+    let file = crate::paths::state_dir().join("usage/by-id").join(format!("claude-{}.json", from.id));
+    // A status line holds the usage file's lock meanwhile.
+    let started = Instant::now();
+    crate::paths::locked(&file, || t.server.check_limits()).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1), "the server loop waited for the lock");
+    assert_eq!(t.server.usage.get(&from).and_then(|u| u.five_hour.as_ref()).map(|w| w.used_percent), Some(90.0));
+    let saved = |file: &std::path::Path| {
+        std::fs::read(file).ok().and_then(|d| serde_json::from_slice::<accounts::Usage>(&d).ok()).map(|u| u.source)
+    };
+    t.until("the usage is saved once the lock is free", |_| saved(&file).as_deref() == Some("screen"));
+    std::fs::remove_file(&file).unwrap();
+    let _ = std::fs::remove_file(file.with_file_name(format!(".claude-{}.json.lock", from.id)));
+}
+
+#[test]
+fn a_second_change_to_a_reserved_home_leaves_its_source_running() {
+    let mut t = SwitchTest::new("reserved-home");
+    let to = t.server.switches.pending[&1].to.clone();
+    let spec = PaneSpec {
+        text: Some(crate::pane::ShownText { title: String::new(), text: "still running".into() }),
+        ..t.server.panes[&1].spec.clone()
+    };
+    let mut pane = crate::pane::Pane::spawn(2, None, spec, 80, 24, &t.server.env, &t.server.tx).unwrap();
+    pane.agent.hooked = true;
+    pane.agent.state = AgentState::Done;
+    t.server.panes.insert(2, pane);
+    let error = t.server.switch_account(2, &to, None, false).unwrap_err();
+    assert!(error.to_string().contains("another pane is already changing"), "{error}");
+    // Automatic selection takes another account.
+    let third = Account::new("claude", "third", t.dir.join("third").display().to_string(), None, false);
+    t.server.accounts.add(third.clone()).unwrap();
+    t.server.accounts.limits.mode = LimitMode::Auto;
+    for (name, percent) in [("from", 95.0), ("to", 0.0), ("third", 0.0)] {
+        let usage = accounts::Usage {
+            five_hour: Some(accounts::Window { used_percent: percent, resets_at: Some(accounts::now() + 3600) }),
+            ..Default::default()
+        };
+        t.server.usage.0.insert(t.server.accounts.get("claude", name).unwrap().key(), usage);
+    }
+    t.server.check_limits();
+    assert_eq!(t.server.switches.get(&2).map(|s| &s.to.id), Some(&third.id));
+    let p = &t.server.panes[&2];
+    assert!(p.exit_code.is_none());
+    assert_eq!(p.spec.account.as_deref(), Some("claude:from"));
+}
+
+/// The pane of a pending change is closed: a change to the same home is not refused for it.
+#[test]
+fn a_closed_panes_change_reserves_nothing() {
+    let mut t = SwitchTest::new("reserved-closed");
+    let to = t.server.switches.pending[&1].to.clone();
+    let spec = PaneSpec {
+        text: Some(crate::pane::ShownText { title: String::new(), text: "still running".into() }),
+        ..t.server.panes[&1].spec.clone()
+    };
+    let mut pane = crate::pane::Pane::spawn(2, None, spec, 80, 24, &t.server.env, &t.server.tx).unwrap();
+    pane.agent.hooked = true;
+    pane.agent.state = AgentState::Done;
+    t.server.panes.insert(2, pane);
+    t.server.panes.remove(&1).unwrap().kill();
+    let result = t.server.switch_account(2, &to, None, false);
+    assert!(result.as_ref().is_ok_and(|()| t.server.switches.contains(2)), "{result:?}");
+}
+
+#[test]
+fn a_hand_started_agents_conversation_is_checked_after_the_picker_opens() {
+    let mut t = SwitchTest::new("observed-picker");
+    t.server.switches.pending.clear();
+    let (client, _peer) = super::super::tests::client(&mut t.server);
+    let program = t.dir.join("claude");
+    crate::testing::write_script(&program, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n");
+    let from = t.server.accounts.get("claude", "from").unwrap();
+    t.spawn(PaneSpec {
+        command: vec![program.display().to_string(), "--session-id".into(), "session".into()],
+        env: vec![("CLAUDE_CONFIG_DIR".into(), from.home.clone())],
+        cwd: Some(t.dir.clone()),
+        ..Default::default()
+    });
+    let started = Instant::now();
+    while !matches!(t.server.observed_agent(1), Ok(Some(_))) {
+        t.server.tick(Instant::now());
+        assert!(started.elapsed() < crate::testing::PATIENCE);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::remove_file(t.dir.join("from/projects/work/session.jsonl")).unwrap();
+    for stale in [false, true] {
+        let mode = t.server.change_account_mode(client, 1);
+        assert!(matches!(&mode, Mode::Picker(p) if p.title == "Change account"), "opened before the check");
+        t.server.clients.get_mut(&client).unwrap().mode = mode;
+        if stale {
+            let observed = t.server.account_discovery.observed.get_mut(&1).unwrap();
+            observed.started = observed.started.wrapping_add(1);
+        }
+        t.until("the checks complete", |t| t.server.jobs.is_empty());
+        let Mode::Picker(p) = &t.server.clients[&client].mode else { panic!("a picker") };
+        assert_eq!(p.title == "Change account", stale, "a stale result leaves the picker");
     }
 }

@@ -210,7 +210,7 @@ fn start_server(
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out)
-        .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+        .current_dir(paths::home_dir().unwrap_or_else(|| "/".into()));
     if let Some(kept) = kept {
         cmd.env(paths::RESTART_FD_VAR, kept.to_string());
     }
@@ -485,7 +485,7 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<std::process::Child
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out)
-        .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+        .current_dir(paths::home_dir().unwrap_or_else(|| "/".into()));
     for var in ["KRAAL_PANE", "KRAAL_SOCKET", "KRAAL_SESSION", "KRAAL_SESSION_NAME"] {
         cmd.env_remove(var);
     }
@@ -864,6 +864,12 @@ fn connect(target: &Target) -> Result<Conn> {
             Ok(Conn { reader, writer, child: Some(child), server: None, ssh_said })
         }
     }
+}
+
+/// Whether to open a link the server sent. A remote server is less trusted than this machine:
+/// only its web links open here, as a `file://` or custom scheme link could run a program.
+fn opens(url: &str, remote: bool) -> bool {
+    !remote || crate::pane::web_link(url)
 }
 
 /// Write a one-line status over the bottom of the screen (used while reconnecting).
@@ -1334,7 +1340,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             ) => {
                                 attachments.message(msg);
                             }
-                            Ok(ServerMsg::Open { url }) => {
+                            Ok(ServerMsg::Open { url }) if opens(&url, matches!(target, Target::Remote { .. })) => {
                                 let _ = crate::pane::open_url(&url);
                             }
                             _ => {}
@@ -1857,5 +1863,16 @@ mod tests {
         // Nor one that says nothing in time.
         let (ready, _end) = std::io::pipe().unwrap();
         assert!(!wait_ready(&ready, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn a_remote_server_opens_only_web_links() {
+        for url in ["https://example.com", "HTTP://example.com/x"] {
+            assert!(opens(url, true), "{url}");
+        }
+        for url in ["file:///x", "x-custom://y", "/Applications/X.app", " https://example.com", "http:"] {
+            assert!(!opens(url, true), "{url}");
+            assert!(opens(url, false), "local sessions keep {url}");
+        }
     }
 }

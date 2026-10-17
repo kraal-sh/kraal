@@ -23,10 +23,17 @@ impl Server {
 
     pub(super) fn apply_known(&mut self, defs: &[WorkspaceDef], inventory: Result<Inventory>, hosts: &[String]) {
         let inv = match inventory {
-            Ok(inv) => inv,
+            Ok(inv) => {
+                self.inventory_read = true;
+                inv
+            }
             Err(e) => {
                 self.warnings.push(format!("{e:#}"));
-                Inventory::empty()
+                // The servers last read stay: an alias must not become a bare host name.
+                let mut inv = Inventory::empty();
+                let last = self.known_servers.iter().filter(|k| k.source == Source::Inventory);
+                inv.servers = last.map(|k| k.server.clone()).collect();
+                inv
             }
         };
         self.known_servers = servers::known(&inv, defs, hosts);
@@ -318,7 +325,7 @@ pub fn ssh_config_hosts() -> Vec<String> {
 }
 
 pub(super) fn ssh_config_hosts_observed(observe: &mut impl FnMut(&Path, bool)) -> (Vec<String>, bool) {
-    let Some(home) = dirs::home_dir() else { return (Vec::new(), false) };
+    let Some(home) = paths::home_dir() else { return (Vec::new(), false) };
     let mut out = Vec::new();
     let failed = read_ssh_config(&home.join(".ssh/config"), &mut out, 0, observe);
     out.sort();
@@ -342,7 +349,7 @@ fn read_ssh_config(path: &Path, out: &mut Vec<String>, depth: u8, observe: &mut 
         } else if key.eq_ignore_ascii_case("include") && depth < 3 {
             for pat in parts {
                 let p = paths::expand_tilde(pat);
-                let p = if p.is_relative() { dirs::home_dir().unwrap_or_default().join(".ssh").join(p) } else { p };
+                let p = if p.is_relative() { paths::home_dir().unwrap_or_default().join(".ssh").join(p) } else { p };
                 // Support a trailing `*` glob, the common case (`Include config.d/*`).
                 if let Some(dir) = p.to_str().and_then(|s| s.strip_suffix("/*")) {
                     observe(Path::new(dir), true);
@@ -396,6 +403,24 @@ mod tests {
         }));
         assert_eq!(directories, [included]);
         assert_eq!(hosts, ["included"], "a failed include does not discard hosts from readable files");
+    }
+
+    #[test]
+    fn an_unreadable_inventory_keeps_the_servers_last_read() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let mut inv = Inventory::empty();
+        inv.servers.push(servers::Server {
+            name: "db".into(),
+            host: "db.lan".into(),
+            port: Some(2222),
+            ..Default::default()
+        });
+        server.apply_known(&[], Ok(inv), &[]);
+        let before = server.resolve_server("db");
+        server.apply_known(&[], Err(anyhow::anyhow!("servers.toml: expected `=`")), &[]);
+        assert_eq!(server.resolve_server("db"), before);
+        assert_eq!(before.unwrap().host, "db.lan");
     }
 
     #[test]

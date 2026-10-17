@@ -152,9 +152,10 @@ impl Server {
     }
 
     pub(super) fn available_workspace_name(&self, base: &str) -> String {
+        let definitions = self.definitions();
         std::iter::once(base.to_string())
             .chain((2..).map(|n| format!("{base}-{n}")))
-            .find(|n| !self.workspace_name_used(n, None, None))
+            .find(|n| !self.workspace_name_used(n, None, None, &definitions))
             .unwrap()
     }
 
@@ -210,10 +211,17 @@ impl Server {
         Ok(ws)
     }
 
-    pub(super) fn workspace_name_used(&self, name: &str, except: Option<u32>, source: Option<&Path>) -> bool {
+    /// `definitions` as [`Server::definitions`] lists them: a search for a free name reads them once.
+    pub(super) fn workspace_name_used(
+        &self,
+        name: &str,
+        except: Option<u32>,
+        source: Option<&Path>,
+        definitions: &[(PathBuf, anyhow::Result<crate::workspace::WorkspaceDef>)],
+    ) -> bool {
         self.workspaces.iter().any(|w| Some(w.id) != except && w.name == name)
             || self.unrestored.iter().any(|w| w.name == name)
-            || self.definitions().iter().any(|(path, def)| {
+            || definitions.iter().any(|(path, def)| {
                 !source.is_some_and(|source| crate::paths::same_file(path, source))
                     && !matches!(self.definition_workspace(path), Ok(Some(_)))
                     && def.as_ref().map_or_else(|_| path.file_stem().is_some_and(|s| s == name), |def| def.name == name)
@@ -225,7 +233,7 @@ impl Server {
         name: &str,
         except: Option<u32>,
     ) -> Result<(), crate::workspace::NameError> {
-        crate::workspace::validate_name(name, self.workspace_name_used(name, except, None))
+        crate::workspace::validate_name(name, self.workspace_name_used(name, except, None, &self.definitions()))
     }
 
     pub(super) fn duplicate_workspace(&mut self, source: u32, name: &str) -> Result<u32, String> {

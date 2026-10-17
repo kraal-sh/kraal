@@ -608,7 +608,7 @@ fn the_runbook_list_asks_before_a_repository_runbook_does_anything() {
     gone(&client, "Trust the runbook deploy");
 
     // A document: its first block waits for the answer; approved from the command line, the
-    // block is typed without a question.
+    // block is typed once a yes says to type it at a prompt kraal cannot see (`sh` marks none).
     pick(&mut client, "notes");
     client.wait_for_row("1. Notes");
     client.send(b"\r");
@@ -622,6 +622,8 @@ fn the_runbook_list_asks_before_a_repository_runbook_does_anything() {
     client.send(b"\x02Rb");
     client.wait_for_row("1. Notes");
     client.send(b"\r");
+    client.wait_for_row("kraal cannot see whether text is typed");
+    client.send(b"y");
     env.wait_for_text("shell", "from-notes");
 }
 

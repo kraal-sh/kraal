@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
-use super::{Controller, Prompt, Request};
+use super::{Controller, Prompt, Request, State};
 use crate::client::paste;
 use crate::files::Side;
 use crate::laptop::copy::{FromClient, Operation};
@@ -29,7 +29,27 @@ impl Controller {
 
     pub fn request(self: &Arc<Self>, pane: PaneId, side: Side, request: u64, path: String) {
         let request = Request { to_laptop: false, operation: Operation::Copy, copy: None, pane, side, request, path };
-        self.state.lock().unwrap().queued.push_back(request);
+        let mut state = self.state.lock().unwrap();
+        // The server ignores the answer to a panel's older listing.
+        state.queued.retain(|r| r.copy.is_some() || (r.pane, r.side) != (pane, side));
+        self.enqueue(state, request);
+    }
+
+    /// Queues `request`, or refuses it at once when the queue is full.
+    pub(super) fn enqueue(self: &Arc<Self>, mut state: MutexGuard<'_, State>, request: Request) {
+        let size = |r: &Request| {
+            r.path.len() + r.copy.as_ref().map_or(0, |(_, sources)| sources.iter().map(String::len).sum())
+        };
+        if state.queued.len() >= super::QUEUED
+            || state.queued.iter().map(size).sum::<usize>() + size(&request) > super::QUEUED_BYTES
+        {
+            drop(state);
+            let retry = if request.copy.is_some() { "retry the copy" } else { "press r" };
+            self.reply(request, Err(format!("Too many laptop requests are waiting: {retry} later")));
+            return;
+        }
+        state.queued.push_back(request);
+        drop(state);
         self.next();
     }
 
@@ -76,7 +96,8 @@ impl Controller {
                 drop(state);
                 self.start(request, scope, generation);
             } else {
-                state.prompt = Some(Prompt { scroll: 0, replacement: None, request, scope, selected: 0 });
+                // Cancel is selected: the server can open this question while Enter is typed for a pane.
+                state.prompt = Some(Prompt { scroll: 0, replacement: None, request, scope, selected: 2 });
                 drop(state);
                 self.draw();
             }
@@ -96,8 +117,9 @@ impl Controller {
         let this = self.clone();
         let retry = request.clone();
         let spawned = crate::threads::named("laptop-list").spawn(move || {
-            let result =
-                dirs::home_dir().ok_or_else(|| "Cannot find the laptop home directory".to_string()).and_then(|home| {
+            let result = crate::paths::home_dir()
+                .ok_or_else(|| "Cannot find the laptop home directory".to_string())
+                .and_then(|home| {
                     let sensitivity = crate::laptop::listing_case_sensitive(&request.path, &home, scope);
                     if let Ok(case_sensitive) = sensitivity {
                         this.send_current(

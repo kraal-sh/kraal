@@ -119,7 +119,7 @@ impl Server {
                 }
             }
             PromptAction::UploadPick { server } => {
-                let base = dirs::home_dir().unwrap_or_default();
+                let base = paths::home_dir().unwrap_or_default();
                 let mut args: Vec<String> = Vec::new();
                 for word in value.split_whitespace() {
                     let p = paths::expand_tilde(word);

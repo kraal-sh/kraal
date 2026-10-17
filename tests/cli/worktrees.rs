@@ -630,6 +630,29 @@ fn a_pane_opened_in_an_unseen_worktree_gets_its_variables() {
     env.wait_for_text("linked", "idx=2 offset=20 port=3020");
 }
 
+/// `kraal wt rm` refused because panes work in the worktree says what `--force` would delete
+/// besides closing them.
+#[test]
+fn a_worktree_panes_work_in_says_what_force_would_delete() {
+    let env = Env::new("wtrmpanes");
+    let repo = env.root.join("app");
+    let _git = git_repo(&repo, &[("a.txt", "1\n")]);
+    let wt = |args: &[&str]| env.cmd(&[&["wt"], args].concat()).current_dir(&repo).output().unwrap();
+    assert!(wt(&["new", "x", "--no-setup"]).status.success());
+    let dir = env.root.join("app.worktrees/x");
+    std::fs::write(dir.join("a.txt"), "2\n").unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"sh\" cwd={:?}\n}}\n", dir.display().to_string()));
+    env.run(&["open", "w"]);
+    env.wait_for_text("sh", "$");
+    let out = wt(&["rm", "x"]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && said.contains("--force closes them and deletes its 1 uncommitted change"),
+        "{said}"
+    );
+    assert!(dir.join("a.txt").exists());
+}
+
 /// The worktrees of a repository are made and removed one at a time, whoever asks at the same
 /// moment (several `kraal wt` here, as a script, or the picker beside it, would): git does not
 /// keep two `git worktree add` apart, and one that reads the entry another is writing fails.

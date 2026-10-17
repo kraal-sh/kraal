@@ -768,7 +768,7 @@ mod imp {
         let wait = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: gethostuuid writes the 16 bytes of the host's UUID.
         let rc = unsafe { libc::gethostuuid(id.as_mut_ptr(), &wait) };
-        (rc == 0).then(|| id.iter().map(|b| format!("{b:02x}")).collect())
+        (rc == 0).then(|| crate::identity::hex(&id))
     }
 
     pub fn boot_id() -> String {

@@ -342,18 +342,7 @@ impl Server {
             let ty = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let _ = writeln!(f, "--- {} {ty}: {cmd}", now_ms());
         }
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(cmd)
-            .envs(hook_env(event))
-            .env("KRAAL_EVENT_JSON", Value::Object(event.clone()).to_string())
-            .env("KRAAL_SOCKET", &self.env.socket)
-            .env("KRAAL_SESSION", &self.env.session)
-            .env("KRAAL_HOOK", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = self.hook_command(cmd, event);
         match crate::exec::own_group(&mut command).spawn() {
             Ok(mut child) => {
                 let output = Some(crate::exec::Drains::start(&mut child, OUTPUT_LIMIT));
@@ -361,6 +350,24 @@ impl Server {
             }
             Err(e) => self.warnings.push(format!("hook {cmd:?}: {e}")),
         }
+    }
+
+    /// `sh -c cmd` with the event's fields over this session's name (a remote agent's event
+    /// names its own session), and this server's socket last: `kraal` in a hook reaches it.
+    fn hook_command(&self, cmd: &str, event: &Map<String, Value>) -> Command {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(cmd)
+            .env("KRAAL_SESSION", &self.env.session)
+            .envs(hook_env(event))
+            .env("KRAAL_EVENT_JSON", Value::Object(event.clone()).to_string())
+            .env("KRAAL_SOCKET", &self.env.socket)
+            .env("KRAAL_HOOK", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
     }
 
     /// Fields that describe a pane in events.
@@ -655,6 +662,18 @@ mod tests {
         assert!(env.contains(&("KRAAL_PANE".into(), "3".into())));
         assert!(env.contains(&("KRAAL_COMMAND".into(), "make test".into())));
         assert!(env.contains(&("KRAAL_PRODUCTION".into(), String::new())));
+    }
+
+    #[test]
+    fn a_remote_event_keeps_its_session_and_the_local_socket() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let server = crate::server::tests::server(tx);
+        let ev = json!({"type": "agent.blocked", "server": "db", "session": "remote", "socket": "/elsewhere"});
+        let command = server.hook_command("true", ev.as_object().unwrap());
+        let env =
+            |name: &str| command.get_envs().find(|(k, _)| **k == *name).and_then(|(_, v)| v.map(|v| v.to_owned()));
+        assert_eq!(env("KRAAL_SESSION"), Some("remote".into()));
+        assert_eq!(env("KRAAL_SOCKET"), Some(server.env.socket.clone().into_os_string()));
     }
 
     #[test]
