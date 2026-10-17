@@ -821,7 +821,7 @@ fn plan_group(
             let mut right = ssh(to);
             right.push(to.destination());
             let dest_dir = remote_abs_dir(&remote_path(to_path));
-            let root = matches!(&remote_paths()[..], [p] if contents_of(p).is_some());
+            let root = remote_paths().iter().any(|p| contents_of(p).is_some());
             right.push(crate::shell::sh_c(&unpack_script(&dest_dir, single.as_deref(), root)));
             let mut step = Step::new("ssh", left);
             step.pipe_to = Some(Box::new(Step::new("ssh", right)));
@@ -1240,7 +1240,8 @@ fn contents_of(p: &str) -> Option<String> {
 /// an existing directory (or a name ending in `/`, or several sources: `single` is `None`)
 /// receives the sources; otherwise the one source takes `dest` as its name. The stream is
 /// unpacked whole into a private directory first: a broken one replaces nothing. `root`: the
-/// stream is the contents of one directory (`dir/`).
+/// stream holds the contents of a directory (`dir/`, maybe among others), whose `.` tar gives
+/// `dest` (the last one's, of several).
 fn unpack_script(dest: &str, single: Option<&str>, root: bool) -> String {
     // Unpacked into `x` inside the private staging: a stream's `.` may give `x` any mode (0777),
     // and others must not put anything in what is about to be published.
@@ -1290,7 +1291,7 @@ fn upload_tar(
 ) -> Result<Step> {
     let mut right = ssh_opts.to_vec();
     right.push(server.destination());
-    let root = matches!(sources, [s] if source_name(s)?.1);
+    let root = sources.iter().any(|s| source_name(s).is_ok_and(|(_, contents)| contents));
     right.push(crate::shell::sh_c(&unpack_script(&remote_abs_dir(&remote_path(path)), single, root)));
     let mut step = pack_local(sources)?;
     step.pipe_to = Some(Box::new(Step::new("ssh", right)));
@@ -1317,7 +1318,7 @@ fn download_tar(
     left.push(crate::shell::sh_c(&pack_remote(&paths)));
     let dest = crate::shell::quote_always(&dest.display().to_string());
     let mut step = Step::new("ssh", left);
-    let root = matches!(&paths[..], [p] if contents_of(p).is_some());
+    let root = paths.iter().any(|p| contents_of(p).is_some());
     step.pipe_to = Some(Box::new(Step::new("sh", vec!["-c".into(), unpack_script(&dest, single, root)])));
     Ok(step)
 }
@@ -3549,6 +3550,21 @@ mod tests {
         drop(placed);
         std::process::Command::new("sh").args(["-c", &unplace_script(&mine_word, &marks)]).status().unwrap();
         assert!(!mine.join(&marks.inside).exists());
+    }
+
+    /// The contents of a directory, alone or among other sources: the destination takes the
+    /// archived mode, as tar gave it; named sources only leave it as it is.
+    #[test]
+    fn copies_of_directory_contents_give_the_destination_their_mode() {
+        let k = known();
+        let dest = parse_endpoint("b:/out/", &k).unwrap();
+        let root = |sources: &[&str]| {
+            let sources: Vec<_> = sources.iter().map(|s| parse_endpoint(s, &k).unwrap()).collect();
+            let steps = plan(&sources, &dest, &opts, &with_rsync(true)).unwrap();
+            crate::shell::unwrap_sh_c(steps[0].pipe_to.as_ref().unwrap().args.last().unwrap()).contains("keep=$(mode")
+        };
+        assert!(root(&["a:/srv/a/"]) && root(&["a:/srv/a/", "a:/srv/b/"]) && root(&["a:/etc/hosts", "a:/srv/a/"]));
+        assert!(!root(&["a:/etc/hosts", "a:/etc/passwd"]));
     }
 
     #[test]

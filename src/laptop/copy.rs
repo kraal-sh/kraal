@@ -1026,6 +1026,8 @@ impl Connection {
         let mut progress = Instant::now();
         let mut reported = progress;
         let mut bytes = [0; 16 * 1024];
+        // The end of what it printed, for the reason it failed.
+        let mut tail = Vec::new();
         let result = (|| -> Result<()> {
             loop {
                 self.check()?;
@@ -1038,6 +1040,8 @@ impl Connection {
                     Ok(0) => {}
                     Ok(n) => {
                         std::io::stderr().write_all(&bytes[..n])?;
+                        tail.extend_from_slice(&bytes[..n]);
+                        tail.drain(..tail.len().saturating_sub(4096));
                         progress = Instant::now();
                         if progress.duration_since(reported) >= timeout.min(Duration::from_secs(1)) / 2 {
                             self.send(FromClient::Progress)?;
@@ -1063,9 +1067,11 @@ impl Connection {
             return Err(error);
         }
         let status = child.wait()?;
+        let tail = String::from_utf8_lossy(&tail);
+        let why = tail.split(['\n', '\r']).map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("no message");
         ensure!(
             status.success(),
-            "copy was not fully installed. Check the destination and any staging path reported above, then retry from the file manager"
+            "copy was not fully installed ({why}). Check the destination and any staging path reported above, then retry from the file manager"
         );
         Ok(())
     }
