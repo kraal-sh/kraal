@@ -261,6 +261,8 @@ impl Server {
             return Ok(());
         }
         anyhow::ensure!(!self.switches.contains(pane), "an account change is already pending for this pane");
+        // A closed pane's change reserves nothing, though the periodic check has not dropped it yet.
+        self.switches.retain_panes(|p| self.panes.contains_key(&p));
         anyhow::ensure!(!self.switches.reserved(to), "another pane is already changing to {}", accounts::label(to));
         anyhow::ensure!(!self.pane_edits.contains_key(&pane), "a pane edit is already being applied");
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;

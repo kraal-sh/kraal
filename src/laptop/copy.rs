@@ -1068,10 +1068,13 @@ impl Connection {
         }
         let status = child.wait()?;
         let tail = String::from_utf8_lossy(&tail);
-        let why = tail.split(['\n', '\r']).map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("no message");
+        // Its last lines: kraal's own summary comes after what failed under it.
+        let lines: Vec<&str> = tail.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).collect();
+        let why = lines[lines.len().saturating_sub(3)..].join(" / ");
         ensure!(
             status.success(),
-            "copy was not fully installed ({why}). Check the destination and any staging path reported above, then retry from the file manager"
+            "copy was not fully installed ({}). Check the destination and any staging path reported above, then retry from the file manager",
+            if why.is_empty() { "no message" } else { &why }
         );
         Ok(())
     }

@@ -2270,6 +2270,24 @@ fn a_second_change_to_a_reserved_home_leaves_its_source_running() {
     assert_eq!(p.spec.account.as_deref(), Some("claude:from"));
 }
 
+/// The pane of a pending change is closed: a change to the same home is not refused for it.
+#[test]
+fn a_closed_panes_change_reserves_nothing() {
+    let mut t = SwitchTest::new("reserved-closed");
+    let to = t.server.switches.pending[&1].to.clone();
+    let spec = PaneSpec {
+        text: Some(crate::pane::ShownText { title: String::new(), text: "still running".into() }),
+        ..t.server.panes[&1].spec.clone()
+    };
+    let mut pane = crate::pane::Pane::spawn(2, None, spec, 80, 24, &t.server.env, &t.server.tx).unwrap();
+    pane.agent.hooked = true;
+    pane.agent.state = AgentState::Done;
+    t.server.panes.insert(2, pane);
+    t.server.panes.remove(&1).unwrap().kill();
+    let result = t.server.switch_account(2, &to, None, false);
+    assert!(result.as_ref().is_ok_and(|()| t.server.switches.contains(2)), "{result:?}");
+}
+
 #[test]
 fn a_hand_started_agents_conversation_is_checked_after_the_picker_opens() {
     let mut t = SwitchTest::new("observed-picker");
