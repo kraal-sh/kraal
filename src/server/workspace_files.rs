@@ -64,7 +64,7 @@ impl Server {
     ) -> Result<u32> {
         let preview = self.preview_import(path)?;
         anyhow::ensure!(preview.revision == *expected, "File changed since preview. Preview it again before adding.");
-        workspace::validate_name(name, self.workspace_name_used(name, None, Some(&preview.path)))?;
+        workspace::validate_name(name, self.workspace_name_used(name, None, Some(&preview.path), &self.definitions()))?;
         for missing in &preview.accounts {
             anyhow::ensure!(
                 choices.iter().any(|(reference, id)| reference == &missing.reference
@@ -173,8 +173,8 @@ mod tests {
         assert!(saved.lock().unwrap().is_empty());
         let ws = server.import_layout(&path, "recipe", &preview.revision, &[]).unwrap();
         server.rename_workspace(ws, "personal").unwrap();
-        assert!(!server.workspace_name_used("recipe", None, None));
-        assert!(!server.workspace_name_used("personal", Some(ws), None));
+        assert!(!server.workspace_name_used("recipe", None, None, &server.definitions()));
+        assert!(!server.workspace_name_used("personal", Some(ws), None, &server.definitions()));
         assert!(
             server
                 .import_layout(&path, "another", &preview.revision, &[])

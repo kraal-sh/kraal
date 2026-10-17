@@ -32,6 +32,13 @@ pub fn visible_char(c: char) -> char {
     }
 }
 
+/// Formatting characters that make a name or a message read other than it is: bidi marks,
+/// embeddings, overrides and isolates, zero-width spaces, word joiners, the BOM. ZWNJ and ZWJ are
+/// not among them: scripts and emoji need them.
+pub fn invisible(c: char) -> bool {
+    matches!(c, '\u{61c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+}
+
 pub fn sanitize(text: &str) -> String {
     text.chars().map(visible_char).collect()
 }
@@ -183,6 +190,17 @@ pub fn unix_seconds(time: SystemTime) -> i64 {
         Ok(after) => i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
         Err(before) => i64::try_from(before.duration().as_secs()).map_or(i64::MIN, |secs| -secs),
     }
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// The local time of `secs` since the epoch, as `localtime_r` gives it.

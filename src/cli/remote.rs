@@ -468,7 +468,7 @@ pub(super) fn remove(args: &[String], expect: &[String]) -> Result<()> {
 /// `kraal files`: the two-panel file manager, on this directory and home by default.
 pub(super) fn files(s: &Session, left: Option<String>, right: Option<String>) -> Result<()> {
     s.ensure_server()?;
-    let home = || dirs::home_dir().unwrap_or_default().display().to_string();
+    let home = || paths::home_dir().unwrap_or_default().display().to_string();
     let abs = |p: String| -> String {
         if p.contains(':') && !p.starts_with('/') && !p.starts_with('.') {
             return p;
@@ -525,6 +525,8 @@ pub(super) fn exec_fleet(
         parallel,
         timeout: std::time::Duration::from_secs(timeout),
         cancel: &cancel,
+        // Printed as each arrives; only `--json` prints them again at the end.
+        keep_output: json,
     };
     let total = list.len();
     let results = fleet::run_all(list, &plan, &print);

@@ -185,8 +185,14 @@ pub struct MdSession {
     sent: HashSet<usize>,
     /// The production reason the user agreed to run steps under, for `target`.
     approved: Option<crate::server::contexts::Production>,
-    /// The user agreed to type steps into a pane on a server.
+    /// The user agreed to type steps into a pane on a server, or at a prompt kraal cannot see.
     remote_ok: bool,
+    /// The user agreed to type the step being checked at a marked prompt whose place a new size lost.
+    unsure_ok: bool,
+    /// What the last check of a step showed that a yes approves: a pane on a server or a prompt
+    /// kraal cannot see (`asked_remote`), a marked prompt whose place was lost (`asked_unsure`).
+    asked_remote: bool,
+    asked_unsure: bool,
 }
 
 impl MdSession {

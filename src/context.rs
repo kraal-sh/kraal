@@ -4,7 +4,7 @@
 //! Everything here is read from local files and `/proc`; kraal never runs kubectl, terraform or
 //! aws itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -392,7 +392,7 @@ pub fn kubeconfig_paths(value: &str) -> Vec<PathBuf> {
     if !paths.is_empty() {
         return paths;
     }
-    dirs::home_dir().map(|h| vec![h.join(".kube").join("config")]).unwrap_or_default()
+    crate::paths::home_dir().map(|h| vec![h.join(".kube").join("config")]).unwrap_or_default()
 }
 
 /// What a kubeconfig file says: its current context, and each context's namespace.
@@ -560,9 +560,14 @@ impl KubeCache {
         self.told.lock().unwrap_or_else(PoisonError::into_inner).get(kubeconfig).map(|(_, since)| *since)
     }
 
-    /// Forget what was told of values no pane uses any more.
+    /// Forget what was told of values no pane uses any more, and the files only they named.
     pub fn retain_told(&self, keep: impl Fn(&str) -> bool) {
-        self.told.lock().unwrap_or_else(PoisonError::into_inner).retain(|v, _| keep(v));
+        let used: HashSet<PathBuf> = {
+            let mut told = self.told.lock().unwrap_or_else(PoisonError::into_inner);
+            told.retain(|v, _| keep(v));
+            told.keys().flat_map(|v| kubeconfig_paths(v)).collect()
+        };
+        self.files.lock().unwrap_or_else(PoisonError::into_inner).retain(|p, _| used.contains(p));
     }
 
     /// Read `kubeconfig` now (a tool is about to act on it), giving up after `limit`: a file
@@ -907,6 +912,23 @@ users:
         assert_eq!(cache.known_since("k"), Some(fourth));
         cache.retain_told(|v| v != "k");
         assert_eq!(cache.known_since("k"), None);
+    }
+
+    #[test]
+    fn files_no_pane_uses_are_forgotten_and_read_again() {
+        let dir = crate::testing::TempDir::new("kube-files");
+        let cache = KubeCache::default();
+        let first = dir.0.join("config-0");
+        for n in 0..20 {
+            let value = dir.write(&format!("config-{n}"), "current-context: first\n").display().to_string();
+            cache.merged(&value);
+            cache.told(&value, cache.number(), true);
+            cache.retain_told(|v| v == value);
+            assert_eq!(cache.files.lock().unwrap().len(), 1, "one file in use");
+        }
+        assert!(!cache.files.lock().unwrap().contains_key(&first));
+        assert_eq!(cache.merged(&first.display().to_string()).current.as_deref(), Some("first"));
+        assert!(cache.files.lock().unwrap().contains_key(&first), "read again");
     }
 
     #[test]

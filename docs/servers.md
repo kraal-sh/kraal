@@ -41,6 +41,8 @@ clipboard_native = false # optional: allow this server's program copies to use n
 Only `name` and `host` are needed, and a name is given once. When kraal changes this file (a
 server added or removed), it edits what changes and leaves the rest as you wrote it:
 your comments, your order, and the keys only another version of kraal reads.
+When the file cannot be read (a syntax error while you edit it), the session says why and keeps
+the servers it last read from it.
 
 It also knows the `ssh` panes of your workspace files (in a group named after the workspace) and
 the hosts of `~/.ssh/config` (the group `ssh-config`; `ssh_config_hosts = false` in the
@@ -114,13 +116,19 @@ The tar fallback reports transferred bytes too, including during a single large 
 | `kraal cp --move a.tar db:/srv/` | copy, then delete what was copied |
 | `kraal cp --no-replace report.pdf db:/tmp/` | refuses, saying what is there, when the copy would replace something in the destination (`--allow report.pdf` lets that name be replaced all the same) |
 | `kraal cp --dry-run …` | only shows the rsync, tar and ssh commands |
-| `kraal rm db:/tmp/old.tar` | deletes files and directories, here or on a server, without asking |
+| `kraal rm db:/tmp/old.tar` | deletes files and directories, here or on a server, without asking (never `/`, `.`, `..` or the home directory) |
 
 A move deletes only what rsync copied (a file is compared by content), renames instead on one file
 system, and refuses when the destination is the source itself, even seen through a link or a
 server that shares this machine's files. On a server, a move between two file systems is refused:
 copy, then delete. A copy that was interrupted keeps what it had in a `.kraal-partial-…`
-directory in the destination, and the same command again goes on from it.
+directory in the destination, and the same command again goes on from it. A copy through tar
+(server to server, or without rsync) never leaves a file cut short: a broken stream replaces
+nothing, but one that stops between two files has put the earlier ones in place, as rsync does.
+What would go to another file system inside the destination (a mount point) is not put there:
+the copy says so and fails.
+Interrupted, it starts over, and what it had received is removed (one stopped with ctrl+c can
+leave it in a hidden `.kraal-…` directory in the destination).
 
 ## The file manager
 
@@ -141,10 +149,15 @@ itself once done, and stays open to show why when one failed.
 
 With `attach --host`, `o` also offers **this laptop**. The session's machine is named by its
 hostname instead of **local**. Choosing the laptop opens a question drawn by your local client;
-nothing is listed before you agree. **Allow** lasts until this attach ends, including automatic
+nothing is listed before you agree. It opens with **Cancel** selected, so an Enter typed as it
+appears refuses. **Allow** lasts until this attach ends, including automatic
 reconnections. **Always** remembers the SSH destination and arguments in
 `~/.config/kraal/laptop-files.toml` (under `$XDG_CONFIG_HOME/kraal` when set). Remove its
 `[[laptop_copy]]` entry, or the file, to revoke Always. Permission is checked again for every request.
+A permission file that is unreadable, malformed, not a regular file or over 1 MiB grants nothing.
+While a question is open or another request runs, the laptop keeps at most 16 waiting requests
+holding 64 MiB of paths; a newer listing of the same panel replaces its waiting one, and
+further requests are refused at once with **Too many laptop requests are waiting**.
 An older grant without `write = true` still permits reading; the first copy into the laptop
 asks for consent again. **Always** then records `write = true`.
 **Cancel** leaves the panel saying **refused: nothing was listed**; `r` asks again.
@@ -188,7 +201,8 @@ remain at the destination.
 
 For copies to the session machine, the receiving job checks the announced total against
 free space in its private spool and the destination before accepting contents. There is no
-per-file size limit; recursive copies visit at most 100,000 entries. A selected folder includes its nested hidden files. Symbolic
+per-file size limit; recursive copies visit at most 100,000 entries, whose paths and link
+targets total at most 64 MiB. A selected folder includes its nested hidden files. Symbolic
 links are copied as links only when their targets resolve inside the allowed scope; FIFOs
 and devices are skipped. File modes (without setuid or setgid) and modification times are
 preserved, but owners, extended attributes and ACLs are not.
@@ -321,8 +335,10 @@ SSH confirms its local listener, or **Error** with the reason. Enter or a click 
 Tab opens the row's actions. Details keep the error and show the time until the next automatic
 retry, with **Close** selected, **Retry now** and **Stop** reachable by keyboard or mouse.
 **Stop** is also available while connecting or ready. Close uses the same return path and leaves
-the tunnel running. Stop removes it and cancels retries. Tunnels come back after a restart
-and reconnect when the network drops. The sidebar shows their state; clicking one opens details.
+the tunnel running. Stop removes it and cancels retries. Tunnels come back after a restart,
+as they were saved (one whose local port is taken then, or whose server servers.toml cannot
+name then, shows **Error** and retries), and reconnect when the network drops. The sidebar shows
+their state; clicking one opens details.
 
 The CLI keeps its existing behavior: without `--local`, `kraal tunnel add` chooses an available
 port and prints it. `kraal tunnel list` keeps the state names `connecting`, `up` and `down`.
@@ -351,7 +367,8 @@ it installs kraal on the server when it has none, then attaches.
 
 Attach from a terminal of your own: inside a kraal pane, `kraal attach` refuses to nest (the
 sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on a link in a
-remote session opens it on your machine. A `localhost` address there is
+remote session opens it on your machine when it is a web link (`http://` or `https://`); other
+links, such as `file://` ones, are kept in paste buffers instead. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 

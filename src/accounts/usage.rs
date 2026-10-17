@@ -117,8 +117,14 @@ pub fn save_usage(a: &Account, u: &Usage) -> Result<()> {
     if let Some(d) = path.parent() {
         paths::ensure_private_dir(d)?;
     }
-    paths::write_private(&path, &serde_json::to_vec(u)?)?;
-    Ok(())
+    paths::locked(&path, || {
+        // Status lines, the Codex poll and the CLI race: an older observation never replaces a newer one.
+        if load_usage(&usage_dir(), &a.agent, &a.id).is_some_and(|saved| saved.observed_at > u.observed_at) {
+            return Ok(());
+        }
+        paths::write_private(&path, &serde_json::to_vec(u)?)?;
+        Ok(())
+    })?
 }
 
 fn load_usage(dir: &Path, agent: &str, id: &str) -> Option<Usage> {
@@ -195,7 +201,16 @@ pub fn usage_from_statusline(v: &serde_json::Value) -> Option<Usage> {
 pub fn limit_from_screen(screen: &str) -> Option<(bool, f64)> {
     let tail: Vec<&str> = screen.lines().rev().filter(|l| !l.trim().is_empty()).take(15).collect();
     for line in tail {
-        let l = line.to_lowercase();
+        let l = line.trim_start_matches(|c: char| c.is_whitespace() || "⎿⏺●■⚠│".contains(c)).to_lowercase();
+        // Only the agent's own message starts the line: a prompt, a diff or an answer quoting one
+        // does not count.
+        let name = l.split(" limit reached").next().unwrap_or_default();
+        if !l.starts_with("you've ")
+            && !["claude usage", "claude ai usage", "usage", "5-hour", "session", "weekly", "opus weekly"]
+                .contains(&name)
+        {
+            continue;
+        }
         let weekly = l.contains("weekly limit");
         let session = l.contains("session limit") || l.contains("5-hour limit") || l.contains("usage limit");
         if !(weekly || session) {

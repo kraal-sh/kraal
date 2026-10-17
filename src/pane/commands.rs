@@ -124,6 +124,9 @@ pub struct Commands {
     history_max: usize,
     /// When a long command ended in this pane, until someone looks at it.
     pub unseen: Option<Instant>,
+    /// The screen from where the command line starts, as the shell left it when it marked that
+    /// place: blank, or zsh's right prompt, drawn first.
+    pub(super) after_input: Option<String>,
 }
 
 impl Commands {
@@ -308,6 +311,8 @@ impl TermPane {
     /// keep their distance to the cursor when only the height changed; a new width rewraps the
     /// lines, and they lose their places.
     pub(super) fn resize_marked(&mut self, size: super::pty::Size) {
+        // The shell draws its line again (zsh its right prompt elsewhere), maybe without a mark.
+        self.commands.after_input = None;
         if self.renew(size) {
             return;
         }
@@ -366,6 +371,7 @@ impl TermPane {
             Mark::Input => {
                 if let Some(last) = self.commands.list.back_mut().filter(|c| !c.ran()) {
                     last.input = Some(spot);
+                    self.commands.after_input = self.point(spot).map(|at| self.screen_from(at));
                 }
             }
             Mark::Output => {
@@ -435,6 +441,11 @@ impl TermPane {
     }
 
     /// The text from `from` up to `to` (not included); None when nothing of it is left.
+    /// The screen's text from `at` to its end.
+    fn screen_from(&self, at: Point) -> String {
+        self.term.bounds_to_string(at, Point::new(self.term.bottommost_line(), self.term.last_column()))
+    }
+
     fn text_between(&self, from: Spot, to: Spot) -> Option<String> {
         if from.gone() || to.gone() || (to.line, to.col) <= (from.line, from.col) {
             return None;
@@ -487,6 +498,23 @@ impl Pane {
     /// Whether the shell in this pane marks its prompts.
     pub fn has_prompts(&self) -> bool {
         self.commands().is_some_and(|c| !c.list.is_empty())
+    }
+
+    /// Whether the shell waits at its prompt with nothing typed, as its marks say: the cursor where
+    /// its command line starts, and the screen from there as the shell left it when it marked that
+    /// place. A draft changes it, even one the cursor went back over, typed ahead or drawn again by
+    /// ctrl+l. `None` when they cannot say: no mark of where the command line starts, or a new
+    /// size since (a shell may draw its line again without marking it).
+    pub fn prompt_empty(&self) -> Option<bool> {
+        let t = self.term()?;
+        let input = t.commands.list.back().filter(|c| !c.ran())?.input?;
+        let (at, after) = (t.point(input)?, t.commands.after_input.as_deref()?);
+        Some(t.cursor_spot() == input && after == t.screen_from(at))
+    }
+
+    /// Whether the shell marked where its command line starts (shell integration).
+    pub fn prompt_marked(&self) -> bool {
+        self.term().is_some_and(|t| t.commands.list.back().is_some_and(|c| !c.ran() && c.input.is_some()))
     }
 
     /// The last command that ran, unless it is running.
@@ -853,6 +881,31 @@ mod tests {
         let full = "x".repeat(30);
         p.feed(format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07{full}\x1b]133;D;0\x07\r\n").as_bytes());
         assert_eq!(p.last_command_output(), Some((Some("cmd".into()), full)));
+        p.kill();
+    }
+
+    #[test]
+    fn a_draft_the_cursor_moved_back_over_is_not_an_empty_prompt() {
+        let (mut p, _rx) = pane(5, 100);
+        // zsh draws its right prompt, then marks the command line.
+        p.feed(b"\x1b]133;A\x07$ \x1b[20CRIGHT\r\x1b[2C\x1b]133;B\x07");
+        assert_eq!(p.prompt_empty(), Some(true));
+        // ` ; echo old` typed, then Home: the cursor is back on the mark, on a blank cell.
+        p.write_input(b" ; echo old".to_vec());
+        p.feed(b" ; echo old\r\x1b[2C");
+        assert_eq!(p.prompt_empty(), Some(false));
+        // ctrl+l: the prompt and its marks drawn again over the draft, the cursor back on the mark.
+        p.feed(b"\x1b[H\x1b[2J\x1b]133;A\x07$ \x1b]133;B\x07 ; echo old\r\x1b[2C");
+        assert_eq!(p.prompt_empty(), Some(false));
+        p.feed(b"\x1b[J");
+        assert_eq!(p.prompt_empty(), Some(true));
+        // A command and a draft in one write: the draft shows at the next prompt.
+        p.write_input(b"true\r ; echo old\x01".to_vec());
+        p.feed(b"true\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07 ; echo old\r\x1b[2C");
+        assert_eq!(p.prompt_empty(), Some(false));
+        // A new width: a shell may draw its line again without marking it, so nobody can tell.
+        p.resize(40, 5);
+        assert_eq!(p.prompt_empty(), None);
         p.kill();
     }
 

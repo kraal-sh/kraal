@@ -39,6 +39,11 @@ fn listing(path: &Path) -> io::Result<Vec<OsString>> {
     Ok(names)
 }
 
+/// Whether reading again may succeed with unchanged inputs: invalid contents wait for a change.
+pub(super) fn retryable(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.is::<io::Error>())
+}
+
 /// Captured before reading, so a write during a scan cannot become its baseline.
 #[derive(Default)]
 pub(super) struct Inputs {

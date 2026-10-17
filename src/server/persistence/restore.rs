@@ -6,7 +6,7 @@ use super::SavedScrollback;
 use crate::layout::{Node, PaneId};
 use crate::paths;
 use crate::persist::{
-    NodeSnap, PaneSnap, SessionSnapshot, WorkspaceKey, WorkspaceSnap, resume_command, scrollback_name,
+    NodeSnap, PaneSnap, SessionSnapshot, TabSnap, WorkspaceKey, WorkspaceSnap, resume_command, scrollback_name,
 };
 use crate::server::{Floating, Server, Tab};
 
@@ -17,16 +17,16 @@ pub(in crate::server) fn apply(server: &mut Server, mut snap: SessionSnapshot) -
     for deleted in &mut server.deleted_workspaces {
         deleted.workspace.bind_accounts(&server.accounts);
     }
-    for t in &snap.tunnels {
+    for t in snap.tunnels {
         let host = if t.remote_host.contains(':') { format!("[{}]", t.remote_host) } else { t.remote_host.clone() };
         let remote = format!("{host}:{}", t.remote_port);
-        // A tunnel through a connection kraal knows by no name goes through that same connection.
-        let added = match &t.via {
-            Some(via) => server.add_tunnel_to(via.clone(), &remote, Some(t.local)),
-            None => server.add_tunnel(&t.server, &remote, Some(t.local)),
-        };
-        if let Err(e) = added {
-            server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
+        // Kept as saved, retried while its port is busy or its server unknown: checking or
+        // resolving it again now would drop it, or change where it goes, at the next save.
+        match crate::server::net::parse_remote(&remote) {
+            Ok(_) => {
+                server.open_tunnel(t);
+            }
+            Err(e) => server.warnings.push(format!("tunnel {}: {e:#}", t.describe())),
         }
     }
     snap.workspaces
@@ -74,7 +74,9 @@ pub(in crate::server) fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap
 }
 
 pub(in crate::server) fn restore_workspace_tabs(server: &mut Server, wi: usize, ws: &WorkspaceSnap) -> Result<()> {
-    if ws.empty {
+    // 0.5.1 saved tabs holding only floating panes that close on success: they restore as empty.
+    let closing = |t: &TabSnap| t.root.is_none() && t.floating.iter().all(|(p, _)| p.spec.close_on_success);
+    if ws.empty || !ws.tabs.is_empty() && ws.tabs.iter().all(closing) {
         return Ok(());
     }
     for t in &ws.tabs {
@@ -241,6 +243,19 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_saved_with_only_panes_that_close_on_success_restores_empty() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let mut snap = saved();
+        let tab = &mut snap.workspaces[0].tabs[0];
+        tab.root = None;
+        tab.floating[0].0.spec.close_on_success = true;
+        apply(&mut server, snap).unwrap();
+        assert!(server.unrestored.is_empty(), "{:?}", server.warnings);
+        assert!(server.workspaces[0].tabs.is_empty());
+    }
+
+    #[test]
     fn v2_layout_and_undo_round_trip_through_storage_and_runtime() {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = crate::server::tests::server(tx);
@@ -356,6 +371,49 @@ mod tests {
             server.warnings,
             ["tunnel saved-connection:invalid host:5432 → localhost:15432: not a host: \"invalid host\""]
         );
+    }
+
+    #[test]
+    fn a_tunnel_whose_port_is_busy_at_restore_stays_saved_as_it_was() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut snap = saved();
+        let tunnel = crate::servers::TunnelSpec {
+            server: "db".into(),
+            via: Some(crate::servers::Server { name: "db".into(), host: "db.lan".into(), ..Default::default() }),
+            local: busy.local_addr().unwrap().port(),
+            remote_host: "localhost".into(),
+            remote_port: 5432,
+        };
+        snap.tunnels.push(tunnel.clone());
+        apply(&mut server, snap).unwrap();
+        assert_eq!(snapshot(&server).tunnels, [tunnel]);
+    }
+
+    #[test]
+    fn a_tunnel_through_a_server_no_longer_known_waits_for_it_instead_of_its_name_as_a_host() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut snap = saved();
+        let tunnel = crate::servers::TunnelSpec {
+            server: "db".into(),
+            via: None,
+            local: free,
+            remote_host: "localhost".into(),
+            remote_port: 5432,
+        };
+        snap.tunnels.push(tunnel.clone());
+        // servers.toml unread: an ~/.ssh/config `Host db` may be another machine than the saved one.
+        let other = crate::servers::Server { name: "db".into(), host: "elsewhere".into(), ..Default::default() };
+        server.known_servers.push(crate::servers::Known { server: other, source: crate::servers::Source::SshConfig });
+        apply(&mut server, snap).unwrap();
+        let info = &server.tunnel_infos()[0];
+        // No ssh started: an unknown server, retried later.
+        assert_eq!(info.state, crate::server::net::TunnelState::Down);
+        assert_eq!(info.error.as_deref(), Some("unknown server db"));
+        assert_eq!(snapshot(&server).tunnels, [tunnel]);
     }
 
     #[test]

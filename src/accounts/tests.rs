@@ -1053,13 +1053,13 @@ fn rules_and_thresholds_choose() {
     assert_eq!(a.choose("claude", None, None, &usage, now).unwrap().name, "perso");
     let pro = a.get("claude", "pro").unwrap();
     // The "work" rule only lists pro: no alternative there, but elsewhere perso is fine.
-    assert!(a.alternative(&pro, Some("work"), None, &usage, now).is_none());
-    assert!(a.alternative(&pro, None, None, &usage, now).is_none(), "unknown usage is not zero");
+    assert!(a.alternative(&pro, Some("work"), None, &usage, now, |_| false).is_none());
+    assert!(a.alternative(&pro, None, None, &usage, now, |_| false).is_none(), "unknown usage is not zero");
     usage.0.insert(
         a.get("claude", "perso").unwrap().key(),
         Usage { five_hour: Some(Window { used_percent: 0.0, resets_at: Some(now + 600) }), ..Default::default() },
     );
-    assert_eq!(a.alternative(&pro, None, None, &usage, now).unwrap().name, "perso");
+    assert_eq!(a.alternative(&pro, None, None, &usage, now, |_| false).unwrap().name, "perso");
     // A window that already reset does not count.
     assert_eq!(usage.peak(&pro, now + 601), Some(0.0));
 }
@@ -1073,18 +1073,34 @@ fn unknown_usage_and_sign_in_required_accounts_are_not_threshold_alternatives() 
     assert_eq!(usage.peak(&perso, 0), None);
     usage.0.insert(perso.key(), Usage::default());
     assert_eq!(usage.peak(&perso, 0), None);
-    assert!(a.alternative(&pro, None, None, &usage, 0).is_none());
+    assert!(a.alternative(&pro, None, None, &usage, 0, |_| false).is_none());
     usage.0.insert(
         a.get("claude", "perso").unwrap().key(),
         Usage { five_hour: Some(Window { used_percent: 0.0, resets_at: Some(100) }), ..Default::default() },
     );
     assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso", "known headroom before unknown");
-    assert_eq!(a.alternative(&pro, None, None, &usage, 0).unwrap().name, "perso");
+    assert_eq!(a.alternative(&pro, None, None, &usage, 0, |_| false).unwrap().name, "perso");
     a.set_sign_in_required(&perso, true);
-    assert!(a.alternative(&pro, None, None, &usage, 0).is_none());
+    assert!(a.alternative(&pro, None, None, &usage, 0, |_| false).is_none());
     a.set_sign_in_required(&perso, false);
     a.accounts.iter_mut().find(|a| a.name == "perso").unwrap().home = pro.home.clone();
-    assert!(a.alternative(&pro, None, None, &usage, 0).is_none(), "an alias is the same account");
+    assert!(a.alternative(&pro, None, None, &usage, 0, |_| false).is_none(), "an alias is the same account");
+}
+
+#[test]
+fn a_new_agent_does_not_start_on_an_account_awaiting_sign_in() {
+    let mut a = accounts();
+    let (pro, perso) = (a.get("claude", "pro").unwrap(), a.get("claude", "perso").unwrap());
+    let mut usage = UsageMap::default();
+    usage.0.insert(
+        pro.key(),
+        Usage { five_hour: Some(Window { used_percent: 95.0, resets_at: Some(600) }), ..Default::default() },
+    );
+    assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso", "unknown usage before a full one");
+    a.set_sign_in_required(&perso, true);
+    assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "pro");
+    a.set_sign_in_required(&pro, true);
+    assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso", "unless all await it");
 }
 
 #[test]
@@ -1462,6 +1478,24 @@ fn screen_limits() {
     assert_eq!(limit_from_screen("…\nYou've hit your session limit · resets 3:45pm\n"), Some((false, 100.0)));
     assert_eq!(limit_from_screen("You've used 85% of your weekly limit · resets Mon"), Some((true, 85.0)));
     assert_eq!(limit_from_screen("all good"), None);
+}
+
+#[test]
+fn screen_limits_are_the_agents_own_messages() {
+    assert_eq!(
+        limit_from_screen("  ⎿  Claude usage limit reached. Your limit will reset at 3pm"),
+        Some((false, 100.0))
+    );
+    assert_eq!(limit_from_screen("5-hour limit reached ∙ resets 3am"), Some((false, 100.0)));
+    assert_eq!(limit_from_screen("■ You've hit your usage limit. Try again in 2 hours."), Some((false, 100.0)));
+    for quoted in [
+        "> what should kraal do when you've hit your usage limit?",
+        "│ > You've used 85% of your weekly limit, what now?",
+        "I see: once you've hit your session limit, kraal changes account.",
+        "+/// Limit messages printed by agents, e.g. \"You've hit your session limit · resets 3:45pm\"",
+    ] {
+        assert_eq!(limit_from_screen(quoted), None, "{quoted}");
+    }
 }
 
 #[test]
@@ -1994,6 +2028,20 @@ fn usage_reads_only_identity_caches_and_leaves_name_caches_untouched() {
     assert_eq!(UsageMap::load_from(&all, &dir).get(&account).unwrap().observed_at, 20);
     assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_older_usage_observation_does_not_replace_a_newer_one() {
+    let account = Account::new("codex", "poll", "/unused/codex-poll".into(), None, false);
+    let saved = || {
+        let file = paths::state_dir().join("usage/by-id").join(usage_file("codex", &account.id));
+        serde_json::from_slice::<Usage>(&std::fs::read(file).unwrap()).unwrap().observed_at
+    };
+    save_usage(&account, &Usage { observed_at: 200, ..Default::default() }).unwrap();
+    save_usage(&account, &Usage { observed_at: 100, ..Default::default() }).unwrap();
+    assert_eq!(saved(), 200);
+    save_usage(&account, &Usage { observed_at: 300, ..Default::default() }).unwrap();
+    assert_eq!(saved(), 300);
 }
 
 #[test]

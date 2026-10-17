@@ -151,17 +151,30 @@ impl Server {
             }
             return;
         }
-        let data = match crate::paths::read_regular(&path, (self.config.buffers.max_bytes() as u64).saturating_mul(8)) {
-            Ok(data) => data,
+        let loaded = match crate::paths::read_regular(&path, (self.config.buffers.max_bytes() as u64).saturating_mul(8))
+        {
+            Ok(data) => self.buffers.load_json(&data),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                self.warnings.push(format!("paste buffers: {}: {e}", crate::paths::shorten_home(&path)));
-                return;
+            Err(e) => Err(e.to_string()),
+        };
+        let Err(e) = loaded else { return };
+        // The next copy would write over buffers that could not be taken back: they are kept aside.
+        let mut moved = Err(std::io::ErrorKind::AlreadyExists.into());
+        for aside in crate::paths::buffers_aside_paths(&self.session) {
+            moved = crate::paths::rename_no_replace(&path, &aside).map(|()| aside);
+            if !moved.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) {
+                break;
+            }
+        }
+        let kept = match moved {
+            Ok(aside) => format!("kept as {}", crate::paths::shorten_home(&aside)),
+            Err(why) => {
+                // Rather than written over, it is left alone until the server stops, settings or not.
+                self.buffers_file_stuck = true;
+                format!("could not move it aside ({why}): buffers are not saved until the server restarts")
             }
         };
-        if let Err(e) = self.buffers.load_json(&data) {
-            self.warnings.push(format!("paste buffers: {}: {e}", crate::paths::shorten_home(&path)));
-        }
+        self.warnings.push(format!("paste buffers: {}: {e}; {kept}", crate::paths::shorten_home(&path)));
     }
 
     /// Write the buffers that changed to their file, when they are kept across restarts. A file
@@ -179,6 +192,9 @@ impl Server {
     /// Have the writer put `data` in the buffers' file, or delete it (`None`): only the latest
     /// waits for it.
     fn write_buffers(&self, data: Option<Vec<u8>>) {
+        if self.buffers_file_stuck {
+            return;
+        }
         let file = (crate::paths::buffers_path(&self.session), data);
         if self.persisting.lock().is_ok_and(|mut p| p.offer_buffers(file)) {
             let _ = self.persister.send(Persist::Buffers);
@@ -213,5 +229,67 @@ pub(super) fn write_file(path: &std::path::Path, data: Option<&[u8]>) -> std::io
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::persistence::{Persist, spawn_persister};
+
+    #[test]
+    fn buffers_that_cannot_be_taken_back_are_kept_aside_from_the_next_copy() {
+        let (tx, _events) = crate::server::event_channel(16);
+        let mut server = crate::server::tests::server(tx.clone());
+        server.session = format!("buffers-aside-{}", crate::identity::new_uuid());
+        server.config.buffers.persist = true;
+        server.persister = spawn_persister(tx, server.persisting.clone(), ()).unwrap();
+        let path = crate::paths::buffers_path(&server.session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        server.load_buffers();
+        let aside = path.with_extension("json.bad");
+        assert!(server.warnings[0].contains(&crate::paths::shorten_home(&aside)), "{:?}", server.warnings);
+        server.keep_copy("hello");
+        server.save_buffers(false);
+        let (done, written) = crossbeam_channel::bounded(1);
+        server.persister.send(Persist::Flush(done)).unwrap();
+        assert_eq!(written.recv_timeout(crate::testing::PATIENCE).unwrap(), Ok(()));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("hello"));
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "not json");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(aside).unwrap();
+    }
+
+    #[test]
+    fn buffers_that_cannot_be_kept_aside_are_not_written_over_after_a_reload() {
+        let (tx, _events) = crate::server::event_channel(16);
+        let mut server = crate::server::tests::server(tx.clone());
+        server.session = format!("buffers-stuck-{}", crate::identity::new_uuid());
+        server.config.buffers.persist = true;
+        server.persister = spawn_persister(tx, server.persisting.clone(), ()).unwrap();
+        let path = crate::paths::buffers_path(&server.session);
+        let asides: Vec<_> = crate::paths::buffers_aside_paths(&server.session).collect();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&asides[0], "earlier").unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        server.load_buffers();
+        assert_eq!(std::fs::read_to_string(&asides[1]).unwrap(), "not json", "{:?}", server.warnings);
+        // No name left to keep it aside: the file stays, and a reload keeping `persist` leaves it.
+        for aside in &asides[2..] {
+            std::fs::write(aside, "earlier").unwrap();
+        }
+        std::fs::write(&path, "not json").unwrap();
+        server.load_buffers();
+        server.keep_copy("hello");
+        let persisted = server.config.buffers.persist;
+        server.config.buffers.persist = true;
+        server.reconfigure_buffers(persisted);
+        let (done, written) = crossbeam_channel::bounded(1);
+        server.persister.send(Persist::Flush(done)).unwrap();
+        assert_eq!(written.recv_timeout(crate::testing::PATIENCE).unwrap(), Ok(()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        for p in asides.iter().chain([&path]) {
+            std::fs::remove_file(p).unwrap();
+        }
     }
 }

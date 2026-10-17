@@ -415,7 +415,8 @@ fn helper_script() -> String {
         "u=$(mktemp -d) || exit 3".into(),
         "trap 'rm -rf -- \"$u\"' EXIT".into(),
         "trap 'exit 1' HUP INT TERM".into(),
-        "dec() { v=$(printf \"${1}x\") && v=${v%x}; }".into(),
+        // An `x` first too: printf would take a name starting with `-` for an option.
+        "dec() { v=$(printf \"x${1}x\") && v=${v#x} && v=${v%x}; }".into(),
         // Exactly $1 bytes of the input: each dd reads once, at most what is still due.
         "rd() { : > \"$u/new\" || return 1; g=0; \
          while [ \"$g\" -lt \"$1\" ]; do \
@@ -684,13 +685,11 @@ fn last_line(text: &str) -> String {
 }
 
 fn new_nonce() -> String {
-    let mut bytes = [0u8; 16];
-    let random = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes));
-    if random.is_err() {
+    let bytes = crate::identity::random_bytes::<16>().unwrap_or_else(|_| {
         let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-        bytes = (t ^ (u128::from(std::process::id()) << 64)).to_le_bytes();
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+        (t ^ (u128::from(std::process::id()) << 64)).to_le_bytes()
+    });
+    crate::identity::hex(&bytes)
 }
 
 /// Overwrite a secret in memory.

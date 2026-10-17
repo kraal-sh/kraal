@@ -87,6 +87,10 @@ fn git_cmd(dir: &Path) -> Command {
 fn git(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let mut cmd = git_cmd(dir);
     cmd.args(args);
+    if args.first() == Some(&"config") {
+        // set_config looks for git's own words about its lock (`git config` runs no hooks).
+        cmd.env("LC_ALL", "C");
+    }
     let out = crate::exec::run(&mut cmd, timeout, 8 << 20).context("running git")?;
     if out.timed_out {
         bail!("git {} took too long", args.join(" "));
@@ -356,13 +360,7 @@ fn project_path_from_files(cwd: &Path) -> std::io::Result<PathBuf> {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(cwd.to_path_buf()),
                     Err(e) => return Err(e),
                 };
-                let main = match common.file_name() {
-                    Some(n) if n == ".git" => {
-                        common.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.to_path_buf())
-                    }
-                    _ => dir.to_path_buf(),
-                };
-                return Ok(project_path_in(cwd, dir, &main));
+                return Ok(project_path_in(cwd, dir, &main_of(dir, &common)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match dir.parent() {
                 Some(up) => dir = up,
@@ -450,12 +448,12 @@ const INDEX_FILE: &str = "kraal-index";
 fn record_worktree(repo: &Path, common: &Path, path: &Path, branch: &str, base: &str) -> Result<u32> {
     let own = git(path, &["rev-parse", "--absolute-git-dir"], Duration::from_secs(2))?;
     let own = PathBuf::from(own.trim());
-    set_config(repo, &format!("branch.{branch}.kraalbase"), base)?;
+    set_config(repo, &[&format!("branch.{branch}.kraalbase"), base])?;
     let used = used_indices(repo, common)?;
     let index = (1..).find(|n| !used.contains(n)).unwrap_or(1);
     std::fs::write(own.join(INDEX_FILE), format!("{index}\n")).context("recording the worktree's number")?;
     // Where older kraals look for it.
-    set_config(repo, &format!("branch.{branch}.kraalindex"), &index.to_string())?;
+    set_config(repo, &[&format!("branch.{branch}.kraalindex"), &index.to_string()])?;
     Ok(index)
 }
 
@@ -500,14 +498,14 @@ fn worktree_index_of(repo: &Path, admin: Option<&Path>, branch: Option<&str>) ->
     admin.and_then(read_index).or_else(|| branch.and_then(|b| worktree_index(repo, b))).unwrap_or(0)
 }
 
-/// Set `key` in the configuration of `repo`. A git writing it at the same moment (another
-/// worktree being made) holds its lock for an instant: then try again.
-fn set_config(repo: &Path, key: &str, value: &str) -> Result<()> {
+/// Change the configuration of `repo` with `git config <args>`. A git writing it at the same
+/// moment (another worktree being made) holds its lock for an instant: then try again.
+fn set_config(repo: &Path, args: &[&str]) -> Result<()> {
     let mut tries = 0;
     loop {
-        match git(repo, &["config", key, value], Duration::from_secs(5)) {
+        match git(repo, &[&["config"], args].concat(), Duration::from_secs(5)) {
             Ok(_) => return Ok(()),
-            Err(e) if tries < 40 && format!("{e:#}").contains(".lock") => {
+            Err(e) if tries < 40 && format!("{e:#}").contains("could not lock config file") => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -840,7 +838,7 @@ fn delete_branch(w: &Worktree, tip: &str, base: Option<&(String, String)>) -> Re
     git_with_input(&w.repo, &["update-ref", "--stdin"], &input, Duration::from_secs(10))
         .with_context(|| format!("the branch {} was kept: it, or its base, moved since it was checked", w.branch))?;
     // What deleting a branch with git also removes: its settings (kraal's base and number).
-    let _ = git(&w.repo, &["config", "--remove-section", &format!("branch.{}", w.branch)], Duration::from_secs(5));
+    let _ = set_config(&w.repo, &["--remove-section", &format!("branch.{}", w.branch)]);
     Ok(())
 }
 
@@ -1251,6 +1249,29 @@ mod tests {
         std::fs::write(dir.join(file), text).unwrap();
         run_git(dir, &["add", file]);
         run_git(dir, &["commit", "-q", "-m", file]);
+    }
+
+    /// A git changing the configuration at the same moment holds its lock for an instant: kraal
+    /// writes once it is free, and tells git's refusal when it stays taken.
+    #[test]
+    fn the_configuration_is_written_once_its_lock_is_free() {
+        let Some((dir, repo)) = test_repo("gitlock") else { return };
+        // Without the wait of its own that a recent git has.
+        run_git(&repo, &["config", "core.configLockTimeout", "0"]);
+        let lock = repo.join(".git/config.lock");
+        std::fs::write(&lock, "").unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::remove_file(&lock).unwrap();
+            });
+            set_config(&repo, &["kraal.test", "1"]).unwrap();
+        });
+        assert_eq!(run_git(&repo, &["config", "kraal.test"]), "1\n");
+        std::fs::write(&lock, "").unwrap();
+        let err = format!("{:#}", set_config(&repo, &["kraal.test", "2"]).unwrap_err());
+        assert!(err.contains("could not lock config file"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Made at the same moment and removed at the same moment by several threads, as the

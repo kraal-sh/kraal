@@ -60,7 +60,7 @@ impl Agent {
         cwd: Option<&Path>,
     ) -> anyhow::Result<crate::accounts::Launch> {
         anyhow::ensure!(account.is_none(), "{}", self.account_message());
-        let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| "/".into()));
+        let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(|| crate::paths::home_dir().unwrap_or_else(|| "/".into()));
         let command = self.installed_command(&cwd).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} is not installed. Install {} and make `{}` available on PATH, then try again.",

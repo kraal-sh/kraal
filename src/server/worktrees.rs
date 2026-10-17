@@ -391,10 +391,10 @@ impl Server {
         };
         let base = if w.base.is_empty() { "the base branch".to_string() } else { w.base.clone() };
         let mut items = vec![
-            item("Review changes", format!("diff against {base}, uncommitted changes included"), "review"),
+            item("Review changes", format!("diff since it left {base}, uncommitted changes included"), "review"),
             item("Commit everything", "stage all changes and commit (you write the message)".into(), "commit"),
         ];
-        if crate::transfer::have_program("gh") {
+        if crate::exec::have_program("gh") {
             items.push(item("Open a pull request", format!("push {} and run gh pr create", w.branch), "pr"));
         }
         items.push(item("Merge into base", format!("merge {} into {base} in {}", w.branch, w.repo.display()), "merge"));
@@ -430,8 +430,7 @@ impl Server {
             "review" => {
                 // One pager view (summary, then the diff); quitting it with q closes the pane.
                 // LESS=-R keeps less open even when the diff fits on one screen.
-                let script = format!("cd {path} && LESS=-R git diff --stat -p {base}");
-                self.git_job(client, "review", script, JobEnd::CloseOnExit);
+                self.git_job(client, "review", review_script(&path, &base), JobEnd::CloseOnExit);
                 Mode::Normal
             }
             "commit" => Mode::Prompt(super::ui::Prompt::new(
@@ -445,10 +444,7 @@ impl Server {
             }
             "merge" => Mode::confirm(
                 format!("Merge {} into the base branch of {}?", w.branch, w.repo.display()),
-                ConfirmAction::GitJob {
-                    label: "merge".into(),
-                    script: format!("cd {repo} && git checkout {base} && git merge --no-ff {branch}"),
-                },
+                ConfirmAction::GitJob { label: "merge".into(), script: merge_script(&repo, &base, &branch) },
             ),
             "remove" => {
                 // Find out what removing would lose before asking (git may take a moment).
@@ -707,6 +703,23 @@ fn plural(n: usize, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
+/// Shell code showing what the worktree at `path` changed since it left `base` (shell words):
+/// what was added to the base since does not show as undone in it.
+fn review_script(path: &str, base: &str) -> String {
+    format!("cd {path} && LESS=-R git diff --stat -p --merge-base {base}")
+}
+
+/// Shell code merging `branch` into `base` in the main checkout `repo` (shell words), only when
+/// the base is a local branch: checking out a commit would leave the merge on no branch.
+fn merge_script(repo: &str, base: &str, branch: &str) -> String {
+    format!(
+        "cd {repo} || exit 1\n\
+         git show-ref -q --verify refs/heads/{base} || \
+         {{ printf '%s was not merged: its base %s is not a local branch\\n' {branch} {base} >&2; exit 1; }}\n\
+         git checkout {base} && git merge --no-ff {branch}\n"
+    )
+}
+
 /// The script that pushes a worktree's branch and opens its pull request, against the branch
 /// the worktree started from (a commit id cannot be a PR base). Nothing runs anywhere else when
 /// the worktree's directory is gone: pushing from the directory the job started in would
@@ -785,6 +798,51 @@ mod tests {
         assert_eq!(base("origin/release"), "release");
         assert_eq!(base("main"), "main");
         assert_eq!(base("it's"), "it's", "an odd name stays as it is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A review shows what the worktree changed since it left its base, not what the base got
+    /// since; a merge goes only into a local branch, never onto a detached checkout.
+    #[test]
+    fn reviews_and_merges_go_by_where_the_worktree_left_its_base() {
+        let dir = std::env::temp_dir().join(format!("kraal-review-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (repo, wt) = (dir.join("repo"), dir.join("wt"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let sh = |script: String| {
+            let out = std::process::Command::new("sh").arg("-c").arg(script).env("GIT_PAGER", "cat").output().unwrap();
+            (
+                out.status.success(),
+                format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+            )
+        };
+        let git = |args: &str| {
+            let (ok, out) = sh(format!("cd {} && git {args}", shell::quote(&repo.display().to_string())));
+            assert!(ok, "{args}: {out}");
+            out
+        };
+        git("init -q -b main");
+        git("config user.name t && git config user.email t@t && git config commit.gpgsign false");
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        git("add a.txt && git commit -q -m one");
+        let fork = git("rev-parse HEAD").trim().to_string();
+        git(&format!("worktree add -q -b kraal/x {}", shell::quote(&wt.display().to_string())));
+        std::fs::write(repo.join("b.txt"), "new on main\n").unwrap();
+        git("add b.txt && git commit -q -m two");
+        std::fs::write(wt.join("a.txt"), "2\n").unwrap();
+        let (path, quoted_repo) = (shell::quote(&wt.display().to_string()), shell::quote(&repo.display().to_string()));
+        let (ok, review) = sh(review_script(&path, "main"));
+        assert!(ok && review.contains("a.txt") && !review.contains("b.txt"), "{review}");
+        git("-C ../wt commit -q -am change");
+        // A base given as a commit: nothing is checked out, nothing merged.
+        let (ok, said) = sh(merge_script(&quoted_repo, &fork, "kraal/x"));
+        assert!(!ok && said.contains("is not a local branch"), "{said}");
+        assert_eq!(git("symbolic-ref HEAD").trim(), "refs/heads/main");
+        // No base recorded: the branch checked out there.
+        let base = format!("$(git -C {quoted_repo} rev-parse --abbrev-ref HEAD)");
+        let (ok, said) = sh(merge_script(&quoted_repo, &base, "kraal/x"));
+        assert!(ok, "{said}");
+        git("merge-base --is-ancestor kraal/x main");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -41,7 +41,7 @@ extern "C" fn isolate() {
     // A test binary that a test starts is told by the first what to stay out of, and has its
     // `PATH` already.
     let told = std::env::var_os(KEEP_OUT);
-    let real_home = if told.is_some() { None } else { dirs::home_dir().filter(|home| home.parent().is_some()) };
+    let real_home = if told.is_some() { None } else { std::env::home_dir().filter(|home| home.parent().is_some()) };
     let keep_out = told.unwrap_or_else(|| developers_directories(real_home.as_deref()));
     let path = path(&std::env::var_os("PATH").unwrap_or_default(), real_home.as_deref(), &root.join("path"));
     let theirs: Vec<OsString> = std::env::vars_os().map(|(name, _)| name).filter(|name| is_theirs(name)).collect();

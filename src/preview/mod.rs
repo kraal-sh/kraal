@@ -10,21 +10,6 @@ mod half_blocks;
 mod load;
 mod markdown;
 mod spans;
-/// `path` with its `.` and `..` worked out from the text alone.
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -289,7 +274,9 @@ impl Preview {
     pub fn title(&self) -> String {
         let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
         name(&self.path)
-            .or_else(|| std::path::absolute(&self.path).ok().map(|p| lexical(&p)).as_deref().and_then(name))
+            .or_else(|| {
+                std::path::absolute(&self.path).ok().map(|p| crate::paths::lexical(&p)).as_deref().and_then(name)
+            })
             .unwrap_or_else(|| self.path.display().to_string())
     }
 

@@ -276,6 +276,8 @@ pub struct Pane {
     /// reported): what the chrome shows of the pane may change with them.
     pub oscs: u64,
     pub bell: bool,
+    /// The second the program's notifications (OSC 9, OSC 777) are counted in, and how many passed.
+    notified: Option<(Instant, u8)>,
     /// Current directory reported by the shell (OSC 7), and the machine it is on.
     pub reported_cwd: Option<PathBuf>,
     pub reported_host: String,
@@ -363,7 +365,16 @@ impl Pane {
         } else {
             Content::Term(Box::new(TermPane::spawn(id, &spec, cols, rows, env, tx)?))
         };
-        Ok(Pane {
+        Ok(Pane::with_content(id, name, spec, content, cols, rows))
+    }
+
+    /// A file manager pane.
+    pub fn files(id: PaneId, name: Option<String>, spec: PaneSpec, files: crate::files::FilesPane) -> Pane {
+        Pane::with_content(id, name, spec, Content::Files(Box::new(files)), 80, 24)
+    }
+
+    fn with_content(id: PaneId, name: Option<String>, spec: PaneSpec, content: Content, cols: u16, rows: u16) -> Pane {
+        Pane {
             id,
             name,
             title: String::new(),
@@ -378,40 +389,7 @@ impl Pane {
             fed: 0,
             oscs: 0,
             bell: false,
-            reported_cwd: None,
-            reported_host: String::new(),
-            seen: Default::default(),
-            reported: None,
-            reported_since_command: false,
-            ssh: None,
-            close_at: None,
-            restart_with: None,
-            suspended: false,
-            preparing: false,
-            search: None,
-            restored: None,
-            attachment: None,
-            ports: Default::default(),
-        })
-    }
-
-    /// A file manager pane.
-    pub fn files(id: PaneId, name: Option<String>, spec: PaneSpec, files: crate::files::FilesPane) -> Pane {
-        Pane {
-            id,
-            name,
-            title: String::new(),
-            spec,
-            content: Content::Files(Box::new(files)),
-            cols: 80,
-            rows: 24,
-            agent: AgentTracker::default(),
-            exit_code: None,
-            last_output: Instant::now(),
-            filled: 0,
-            fed: 0,
-            oscs: 0,
-            bell: false,
+            notified: None,
             reported_cwd: None,
             reported_host: String::new(),
             seen: Default::default(),
@@ -559,7 +537,18 @@ impl Pane {
                 continue;
             }
             match osc {
-                Osc::Notify { title, body } => signals.push(PaneSignal::Notification { title, body }),
+                // Three a second at most: a program printing them in a loop would flood every
+                // client, and start a notify-send each.
+                Osc::Notify { title, body } => {
+                    let (since, sent) = self
+                        .notified
+                        .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(1))
+                        .unwrap_or((Instant::now(), 0));
+                    if sent < 3 {
+                        self.notified = Some((since, sent + 1));
+                        signals.push(PaneSignal::Notification { title, body });
+                    }
+                }
                 Osc::Cwd { host, path } => {
                     self.reported_cwd = Some(path);
                     self.reported_host = host;
@@ -742,7 +731,14 @@ impl Pane {
         }
     }
 
+    /// What the user sends the program: typed, pasted, broadcast, `kraal send`.
     pub fn write_input(&mut self, bytes: Vec<u8>) {
+        self.agent.typed = true;
+        self.write_program(bytes);
+    }
+
+    /// What kraal itself sends the program (focus reports): no draft of the user's.
+    pub fn write_program(&mut self, bytes: Vec<u8>) {
         if let Content::Term(t) = &mut self.content {
             t.term.scroll_display(Scroll::Bottom);
             t.settle();
@@ -976,6 +972,11 @@ pub fn release_memory() {
     unsafe {
         libc::malloc_trim(0);
     }
+}
+
+/// Whether `url` is an `http://` or `https://` link, the only ones a remote client opens.
+pub fn web_link(url: &str) -> bool {
+    ["http://", "https://"].iter().any(|s| url.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s)))
 }
 
 /// Open a URL with the desktop's default application.
@@ -1275,6 +1276,57 @@ mod tests {
         // A report after the prompt that ends the one before stays.
         let next: &[u8] = b"exit\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07\x1b]7701;context;k8s=dev;tf=;aws=\x07";
         assert!(contexts(pane.feed(next)));
+        pane.kill();
+    }
+
+    /// A program that prints notifications in a loop gets three through a second.
+    #[test]
+    fn a_flood_of_notifications_is_three_a_second() {
+        let (tx, _rx) = crate::server::event_channel(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let mut pane = Pane::spawn(1, None, spec, 40, 5, &env, &tx).unwrap();
+        let notifications =
+            |signals: Vec<PaneSignal>| signals.iter().filter(|s| matches!(s, PaneSignal::Notification { .. })).count();
+        let flood = b"\x1b]9;hi\x07".repeat(100);
+        assert_eq!(notifications(pane.feed(&flood)) + notifications(pane.feed(&flood)), 3);
+        // A second later.
+        pane.notified = pane.notified.map(|(at, sent)| (at - std::time::Duration::from_secs(1), sent));
+        assert_eq!(notifications(pane.feed(&flood)), 3);
+        pane.kill();
+    }
+
+    /// A draft typed while the agent worked is still there once its turn ends, even ending with
+    /// Enter (backslash Enter is a new line); the agent taking a prompt sends it; what kraal sends
+    /// itself (a focus report) is no draft.
+    #[test]
+    fn a_draft_outlives_the_agents_turn_until_it_takes_a_prompt() {
+        let (tx, _rx) = crate::server::event_channel(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let mut pane = Pane::spawn(1, None, spec, 40, 5, &env, &tx).unwrap();
+        pane.agent.set(crate::agent::AgentState::Working);
+        pane.write_input(b"half a prompt".to_vec());
+        pane.agent.set(crate::agent::AgentState::Done);
+        assert!(pane.agent.typed);
+        pane.write_input(b"\\\r".to_vec());
+        assert!(pane.agent.typed);
+        pane.agent.set(crate::agent::AgentState::Working);
+        assert!(!pane.agent.typed);
+        pane.write_program(b"\x1b[O".to_vec());
+        assert!(!pane.agent.typed);
         pane.kill();
     }
 

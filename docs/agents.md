@@ -138,8 +138,15 @@ their hooks when a session starts, and Gemini CLI runs them only in folders you 
 covers Claude Code and Codex, and each other agent whose directory exists (`~/.gemini`,
 `~/.copilot`, …).
 
+The homes of your other Claude and Codex [accounts](#accounts) get them too: a Claude home
+without `settings.json` is linked to the hooked one (a `settings.json` of its own is left alone,
+and said), and each Codex home's `config.toml` gets the same `notify`, which `uninstall` takes out
+again. `status` says **partially installed** while one of them lacks the hooks.
+
 The hooks do nothing outside kraal. Some agents run another agent's hooks (Cursor and Continue
-run Claude Code's): kraal ignores a hook for an agent other than the one running in its pane. An
+run Claude Code's): kraal ignores a hook for an agent other than the one running in its pane,
+and one from an agent run that one started (`claude -p` from its Bash tool, which inherits the
+pane and its hooks): it neither replaces the conversation nor ends the session. An
 agent whose hooks tell every state (those of the table but Gemini CLI, Codex, Cursor CLI and
 Augment) is followed even under a wrapper kraal does not recognise (`bash -c 'opencode; …'`):
 until its hooks say the session ended, or, for OpenCode and Kilo, whose plugins cannot say it,
@@ -192,10 +199,11 @@ untracked files, commits ahead).
 In the agent picker (`ctrl+b a`), select an agent or account and press Tab, then **Start in worktree**: kraal creates a branch
 `kraal/<name>` and a directory next to the repository (`<repo>.worktrees/<name>`), and starts the
 agent there in its own tab. Several agents can work on the same repository without stepping on each
-other. `ctrl+b R g` in that tab reviews the changes (your pager, delta included), commits them, opens
-a pull request (`gh`), merges into the base branch or removes the worktree. Removing says first
-what would be lost (uncommitted changes, commits the base does not have, ignored files of its
-own) and which panes it closes. Account rules written for the repository also apply in its
+other. `ctrl+b R g` in that tab reviews the changes made since it left its base (your pager, delta
+included), commits them, opens a pull request (`gh`), merges into the base branch (only a local
+branch: not a base given as a commit or a remote branch) or removes the worktree. Removing says
+first what would be lost (uncommitted changes, commits the base does not have, ignored files of
+its own) and which panes it closes. Account rules written for the repository also apply in its
 worktrees.
 
 | Command | |
@@ -207,7 +215,7 @@ worktrees.
 | `kraal wt list` | this repository's worktrees, with each one's number |
 | `kraal wt rm fix-login` | removes one with its branch; refuses if it would lose changes, unmerged commits or ignored files, or while panes work in it |
 | `kraal wt rm fix-login --discard-ignored` | removes it with ignored files of its own |
-| `kraal wt rm fix-login --force` | removes anyway, closing the panes that work in it |
+| `kraal wt rm fix-login --force` | removes anyway, closing the panes that work in it and deleting its changes, unmerged commits and ignored files (stopped by those panes, `rm` says which it has) |
 | `kraal wt prune` | removes those merged into their base and clean |
 | `kraal wt prune --dry-run` | only says which ones would go |
 | `kraal wt prune --discard-ignored` | also those whose only leftovers are ignored files |
@@ -308,7 +316,7 @@ kraal accounts add claude pro
 | `kraal accounts review claude` | answers which account an existing sign-in belongs to, without another login |
 | `kraal accounts login claude:pro` | logs an account in again |
 | `kraal accounts rename claude:pro work` | renames it: rules and usage follow, the directory stays |
-| `kraal accounts rm claude:work` | forgets it; its directory is kept |
+| `kraal accounts rm claude:work` | forgets it; its directory is kept, and adding the name again reuses its sign-in (`kraal accounts login` signs in again) |
 | `kraal accounts limits --threshold 85 --mode ask` | sets the threshold and what happens there (below) |
 | `kraal agent claude` | starts Claude Code on the account the rules pick, in a new pane whose id it prints (in this terminal outside kraal) |
 | `kraal agent codex --account work --right` | on that account, in a split on the right (`--down`, `--floating` and `--tab` place it too; `--here` runs it in this terminal even inside kraal) |
@@ -463,12 +471,12 @@ A Claude conversation must have a readable transcript on the current account. If
 empty, unreadable, or has diverged from the destination's copy, kraal refuses and says why, leaving the
 agent running. This also applies before Claude has written its first transcript: let it finish
 a turn before changing accounts. Transcript searches, checks and copies run in the background.
-Kraal refuses a destination whose account home is in use by another process, or whose separate
-transcript is open in another process. Stop that agent before trying again. Shared transcripts
-need no copy. Transfers of the same conversation lock both account stores; another transfer
-must finish before retrying. Finishing or failing a transfer releases its locks even while
-a child process is still starting. The lock files remain in `projects`; their presence alone
-does not mean a transfer is running.
+Kraal refuses a destination whose account home is in use by another process or by another
+pending change, or whose separate transcript is open in another process. Stop that agent before
+trying again. Shared transcripts need no copy. Transfers of the same conversation lock both account
+stores; another transfer must finish before retrying. Finishing or failing a transfer releases its
+locks even while a child process is still starting. The lock files remain in `projects`; their
+presence alone does not mean a transfer is running.
 
 When replacing an older destination transcript, kraal checks the revision it actually moved
 and keeps that file at `projects/<project>/.kraal-transfer-<id>-<unique>/previous.jsonl` in the
@@ -503,6 +511,8 @@ the foreground process, account home, saved conversation and exact resume argume
 selector or a hook from that process supplies the conversation id. An opaque wrapper, credential
 override, unknown conversation or ambiguous command instead shows **Can't switch this process.**
 and offers **Open with another account**. That opens another pane and leaves the original running.
+Its saved conversation is checked in the background: the picker opens at once and turns into
+that message if the conversation cannot be resumed.
 Shells with other jobs are not stopped for an account change.
 If process information is temporarily unavailable, kraal keeps the last identified account
 label. It still requires a fresh check before stopping the agent. A failed check leaves the
@@ -545,8 +555,8 @@ The command-line add and login commands also verify sign-in after the login succ
 Claude Code passes the 5-hour and weekly usage to its status line;
 `kraal integration install claude` puts a small status line in front of yours that records it,
 then runs yours unchanged. Codex accounts are asked through Codex's own app-server every few
-minutes (`kraal accounts refresh` asks now). Limit messages on screen ("You've hit your session
-limit") count too.
+minutes (`kraal accounts refresh` asks now). Limit messages the agent prints on screen ("You've
+hit your session limit") count too; a line that only quotes one (a prompt, a diff) does not.
 
 The CLI usage bars, account summaries and thresholds share the same expiry rule.
 A reported reset ends a window at that time. Without a reset time, it counts for five hours
@@ -603,7 +613,8 @@ directory.
 
 The first rule that matches decides. A new agent starts on the first account of that rule whose
 known usage is under its threshold. Otherwise it tries the first account with unknown usage,
-or, when all have known usage over the threshold, the one whose usage resets first. When
+or, when all have known usage over the threshold, the one whose usage resets first. Accounts
+marked as needing sign-in are left out, unless all of them are. When
 the matching rule names no account that exists any more, no account is used there (rather than
 any). Without a matching rule, every confirmed account of the agent may be used, in list order. When
 the account of a running agent reaches its threshold, kraal notifies you (`notify`) with
@@ -612,7 +623,13 @@ open that pane's account picker, even when another pane has focus. In `ask` mode
 continue the conversation on another account once the agent finished its turn. In `auto` mode
 it does so by itself at the end of the turn. `auto` only switches when the agent's own hooks said
 its turn ended, which Claude Code's do (`kraal integration install claude`) and Codex's cannot;
-otherwise kraal asks instead, since restarting an agent mid-turn would lose its work. Limits are
+otherwise kraal asks instead, since restarting an agent mid-turn would lose its work. It also
+asks once you have looked at the finished pane or sent it input (typed, pasted, broadcast or
+`kraal send`), since its prompt may hold a draft, until the agent takes a prompt (its hook says
+so; for an agent without such a hook, once it goes from waiting to working); this is checked
+again just before stopping. Only an agent that exited or whose finished turn is still unseen is switched by
+itself. Two agents never change to the same Claude account
+at once: `auto` picks another account, and a manual change to it is refused. Limits are
 watched for agents kraal started on an account and for shell launches it can associate safely. A Claude conversation continues on the other account; a
 Codex one cannot (its history stays in its account's directory), so switching starts a new one.
 Threshold alternatives need known usage below their threshold; unknown usage is not zero.

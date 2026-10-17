@@ -562,8 +562,9 @@ impl Server {
                         self.panes.get_mut(&p).unwrap().spec = spec;
                     }
                     let pane = self.panes.get_mut(&p).unwrap();
-                    if let Err(e) = pane.respawn(&self.env, &self.tx) {
-                        self.toast(id, NoticeKind::Error, format!("{e:#}"));
+                    match pane.respawn(&self.env, &self.tx) {
+                        Ok(()) => self.runbook_pane_started(p),
+                        Err(e) => self.toast(id, NoticeKind::Error, format!("{e:#}")),
                     }
                     self.relayout();
                 }

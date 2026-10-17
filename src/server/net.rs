@@ -307,9 +307,13 @@ impl Server {
         self.add_tunnel_to(s, remote, local)
     }
 
-    /// The server a tunnel goes through.
+    /// The server a tunnel goes through: its saved connection, or the known server it names.
     pub fn tunnel_target(&self, spec: &TunnelSpec) -> Option<crate::servers::Server> {
-        spec.via.clone().or_else(|| self.resolve_server(&spec.server))
+        // A name kraal no longer knows is not a host name: it would reach another machine. Nor is
+        // it looked up while servers.toml could not be read: another source may have that name.
+        let known = self.known_servers.iter().filter(|_| self.inventory_read);
+        let named = || known.clone().find(|k| k.server.name == spec.server).map(|k| k.server.clone());
+        spec.via.clone().or_else(named)
     }
 
     /// Open (and keep open) a tunnel to `remote` through the server `s` (a known one, or a
@@ -334,6 +338,11 @@ impl Server {
         } else {
             TunnelSpec { server: s.address(), via: Some(s), local, remote_host, remote_port }
         };
+        Ok(self.open_tunnel(spec))
+    }
+
+    /// Keep the tunnel `spec` open from now on: one that cannot start now retries (with backoff).
+    pub(super) fn open_tunnel(&mut self, spec: TunnelSpec) -> TunnelInfo {
         let id = self.alloc_id();
         let mut t = Tunnel {
             id,
@@ -354,7 +363,7 @@ impl Server {
         self.refresh_tunnel_pickers();
         self.mark_persist();
         self.mark_dirty();
-        Ok(info)
+        info
     }
 
     /// Close the tunnel on local port `key` (`5432` or `:5432`): the port is what names a tunnel,
@@ -647,6 +656,9 @@ mod tests {
     fn retries_keep_the_port_report_backoff_and_stop_cancels_them() {
         let (tx, _rx) = super::super::event_channel(32);
         let mut server = super::super::tests::server(tx);
+        let db = crate::servers::Server { name: "db".into(), host: "db".into(), ..Default::default() };
+        server.known_servers.push(crate::servers::Known { server: db, source: crate::servers::Source::Inventory });
+        server.inventory_read = true;
         let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = busy.local_addr().unwrap().port();
         let mut tunnel = test_tunnel(42, port, TunnelState::Down);

@@ -404,6 +404,13 @@ impl Server {
         self.advance_run(ri);
     }
 
+    /// A waiting target the user started by hand: its run takes it as started from now.
+    pub(in crate::server) fn runbook_pane_started(&mut self, pane: PaneId) {
+        if let Some(ri) = self.runs.iter().position(|r| r.items.iter().any(|i| i.pane == pane)) {
+            self.advance_run(ri);
+        }
+    }
+
     /// A pane of a run was closed while it ran or waited: nothing more starts. Targets already
     /// running finish (stopping a deploy halfway can be worse than letting it end).
     pub(in crate::server) fn runbook_pane_closed(&mut self, pane: PaneId) {
@@ -543,6 +550,18 @@ impl Server {
             for item in run.items.iter_mut().filter(|i| !i.state.pending()) {
                 item.process = None;
             }
+        }
+        // A waiting target the user started by hand runs: it counts, is timed and is never skipped.
+        let by_hand: Vec<PaneId> = self
+            .runs
+            .get(ri)
+            .into_iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.state == ItemState::Waiting && self.panes.get(&i.pane).is_some_and(|p| !p.suspended))
+            .map(|i| i.pane)
+            .collect();
+        for p in by_hand {
+            self.start_waiting(ri, p);
         }
         loop {
             let Some(run) = self.runs.get(ri) else { return };
@@ -1002,6 +1021,47 @@ mod tests {
         assert_eq!(server.panes[&panes[0]].exit_code, Some(Some(7)));
         assert!(server.panes[&panes[1]].name.as_deref().unwrap().contains("skipped"));
         assert!(!marker.exists());
+        for pane in panes {
+            server.close_pane(pane);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_waiting_target_started_by_hand_runs_on_when_another_fails() {
+        let (tx, rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        crate::server::persistence::tests::writer(&mut server, vec![]);
+        let dir = std::env::temp_dir().join(format!("kraal-run-by-hand-{}", crate::identity::new_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let release = dir.join("release");
+        let mut d = draft();
+        d.steps.stop_on_failure = true;
+        let spec =
+            |command: String| PaneSpec { command: vec!["/bin/sh".into(), "-c".into(), command], ..Default::default() };
+        let wait = format!("while [ ! -f {} ]; do sleep 0.02; done; exit 7", shell::quote(release.to_str().unwrap()));
+        let targets = vec![("first".into(), spec(wait)), ("second".into(), spec("sleep 60".into()))];
+        server.start_run(&d, 50, &dir.join("run.log"), targets, 1, None).unwrap();
+        let panes: Vec<_> = server.runs[0].items.iter().map(|i| i.pane).collect();
+        // What Enter on the waiting pane does.
+        server.panes.get_mut(&panes[1]).unwrap().respawn(&server.env, &server.tx).unwrap();
+        server.runbook_pane_started(panes[1]);
+        assert_eq!(server.runs[0].items[1].state, ItemState::Running);
+        let process = server.panes[&panes[1]].process_hold().unwrap();
+        std::fs::write(release, "").unwrap();
+        let start = Instant::now();
+        while server.runs[0].items[0].state == ItemState::Running {
+            while let Ok(event) = rx.try_recv() {
+                server.handle(event);
+            }
+            server.finish_exits();
+            assert!(start.elapsed() < crate::testing::PATIENCE);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.runs[0].items[0].state, ItemState::Failed(Some(7)));
+        assert_eq!(server.runs[0].items[1].state, ItemState::Running);
+        assert!(server.panes[&panes[1]].process_hold().unwrap().is(&process));
+        assert!(!server.panes[&panes[1]].name.as_deref().unwrap().contains("skipped"));
         for pane in panes {
             server.close_pane(pane);
         }

@@ -101,8 +101,28 @@ impl Server {
         let managed = self.panes.get(&pane).is_some_and(|p| p.spec.account.is_some() || p.spec.account_id.is_some());
         if !managed {
             match self.observed_agent(pane) {
-                Ok(Some(a)) if accounts::check_resume(&a.account, &a.session).is_ok() => {
-                    self.account_discovery.observe(pane, a);
+                Ok(Some(a)) => {
+                    self.account_discovery.observe(pane, a.clone());
+                    // The transcript may be large: read it off the event loop, then take back the
+                    // picker it still applies to.
+                    let (account, session) = (a.account.clone(), a.session.clone());
+                    self.background(
+                        move || accounts::check_resume(&account, &session).is_ok(),
+                        move |server, resumable| {
+                            if resumable || server.account_discovery.observed(&pane) != Some(&a) {
+                                return;
+                            }
+                            if let Some(c) = server.clients.get_mut(&client)
+                                && let Mode::Picker(p) = &c.mode
+                                && p.items
+                                    .iter()
+                                    .any(|i| matches!(i.action, PickAction::AgentSwitch { pane: target, .. } if target == pane))
+                            {
+                                c.mode = cannot_switch_mode(pane);
+                                server.mark_dirty();
+                            }
+                        },
+                    );
                 }
                 Ok(_) => {
                     self.account_discovery.forget_pane(pane);
@@ -133,7 +153,7 @@ impl Server {
             .clients
             .get(&client)
             .and_then(|c| self.agent_cwd(c.workspace, self.client_focus(client), None))
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| "/".into()));
+            .unwrap_or_else(|| crate::paths::home_dir().unwrap_or_else(|| "/".into()));
         let now = accounts::now();
         let current = switch_for.and_then(|p| self.pane_account(p));
         let mut items = Vec::new();

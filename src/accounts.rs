@@ -75,7 +75,7 @@ pub enum Mode {
 }
 
 /// `[limits]` of accounts.toml.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
     /// Usage (percent of the 5-hour or weekly window) at which an account counts as full.
     #[serde(default = "default_threshold")]
@@ -158,7 +158,7 @@ struct Rule {
 }
 
 /// `[claude]` of accounts.toml.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClaudeOptions {
     /// The user's own status line command, run after kraal's (kraal records usage first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,7 +172,7 @@ impl ClaudeOptions {
 }
 
 /// accounts.toml as loaded, saved back to the file it came from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Accounts {
     pub limits: Limits,
     pub claude: ClaudeOptions,

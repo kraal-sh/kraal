@@ -73,7 +73,11 @@ pub(super) fn forget(s: &Session) -> Result<()> {
     let attachments = crate::attachments::remove(session)?;
     let scrollback = crate::persist::forget_scrollback(session)?;
     let buffers_path = paths::buffers_path(session);
-    let buffers = remove_saved(&buffers_path)?;
+    // Buffers a server could not take back were kept aside: they may hold secrets too.
+    let mut buffers = remove_saved(&buffers_path)?;
+    for aside in paths::buffers_aside_paths(session) {
+        buffers |= remove_saved(&aside)?;
+    }
     for (removed, path) in [
         (state, p),
         (scrollback, paths::scrollback_dir(session)),

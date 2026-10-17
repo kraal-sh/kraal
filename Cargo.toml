@@ -16,11 +16,10 @@ exclude = ["/assets"]
 alacritty_terminal = "0.26"
 anyhow = "1"
 base64 = "0.22"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 color_quant = "1.1"
 crossbeam-channel = "0.5"
-crossterm = "0.29"
-dirs = "6"
+crossterm = { version = "0.29", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 kdl = { version = "6", features = ["v1-fallback"] }
 libc = "0.2"

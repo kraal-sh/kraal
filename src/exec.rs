@@ -34,6 +34,11 @@ impl Output {
     }
 }
 
+/// Whether `name` is a program on the PATH.
+pub fn have_program(name: &str) -> bool {
+    std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).any(|d| d.join(name).is_file())).unwrap_or(false)
+}
+
 /// Put the command in its own process group, so killing it reaches its descendants.
 pub fn own_group(cmd: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;

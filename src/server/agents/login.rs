@@ -13,7 +13,7 @@ impl Server {
     pub(in crate::server) fn add_account(&mut self, client: ClientId, agent: &str, name: &str) -> Result<PaneId> {
         let kind = accounts::agent_kind(agent).context("Unknown agent")?;
         anyhow::ensure!(
-            crate::transfer::have_program(kind.command),
+            crate::exec::have_program(kind.command),
             "{} is not installed. Install {}, then try again.",
             super::super::account_ui::agent_name(agent),
             kind.command
@@ -138,7 +138,7 @@ impl Server {
 }
 
 pub(in crate::server) fn login_start_failed(command: &[String]) -> LoginState {
-    if command.first().is_some_and(|c| crate::transfer::have_program(c)) {
+    if command.first().is_some_and(|c| crate::exec::have_program(c)) {
         LoginState::Failed
     } else {
         LoginState::Checked(Status::NotInstalled)

@@ -59,10 +59,10 @@ impl Server {
         let local = focus
             .filter(|p| p.ssh.is_none())
             .and_then(|p| p.current_cwd())
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+            .unwrap_or_else(|| paths::home_dir().unwrap_or_default());
         let right = match focus.and_then(|p| p.ssh.as_ref()) {
             Some(s) if self.known_servers.iter().any(|k| k.server.name == s.name) => format!("{}:~", s.name),
-            _ => dirs::home_dir().unwrap_or_default().display().to_string(),
+            _ => paths::home_dir().unwrap_or_default().display().to_string(),
         };
         (local.display().to_string(), right)
     }
@@ -176,7 +176,7 @@ impl Server {
                 // replaces only what the user agreed to.
                 let mut args = vec!["cp".to_string(), "--no-replace".to_string()];
                 for name in &replaces {
-                    args.extend(["--allow".to_string(), name.clone()]);
+                    args.push(format!("--allow={name}"));
                 }
                 args.extend(expect);
                 args.push("--".into());
@@ -199,7 +199,7 @@ impl Server {
             FilesAction::Move { sources, dest, replaces } => {
                 let mut args = vec!["cp".to_string(), "--move".to_string(), "--no-replace".to_string()];
                 for name in &replaces {
-                    args.extend(["--allow".to_string(), name.clone()]);
+                    args.push(format!("--allow={name}"));
                 }
                 args.extend(expect);
                 args.push("--".into());
@@ -244,13 +244,12 @@ impl Server {
                         Some(s) => {
                             let mut command = self.ssh_command(&s);
                             command.insert(1, "-t".into());
-                            let cd = if r.path == "~" || r.path.is_empty() {
-                                "cd".to_string()
-                            } else {
-                                format!("cd {}", crate::shell::quote(&r.path))
-                            };
-                            // A POSIX script, whatever the login shell there (fish, csh…).
-                            let script = format!("{cd} && exec \"${{SHELL:-sh}}\" -l");
+                            // A POSIX script, whatever the login shell there (fish, csh…); the
+                            // path may still be `~/x` as typed, before a listing expanded it.
+                            let script = format!(
+                                "cd -- {} && exec \"${{SHELL:-sh}}\" -l",
+                                crate::files::remote_dir_arg(&r.path)
+                            );
                             command.push(crate::shell::sh_c(&script));
                             let spec = PaneSpec { command, server: Some(s.name.clone()), ..Default::default() };
                             self.spawn_pane_in(ws, None, spec, Placement::Tab, Some(s.name.clone()))
@@ -525,7 +524,7 @@ mod tests {
         server.clients.get_mut(&owner).unwrap().laptop =
             Some(Identity { id: "abc".into(), host: "travel".into(), os: "linux".into() });
         let laptop = Location::Laptop { owner_id: "abc".into(), host: "travel".into(), path: "~/Docs".into() };
-        for (root, shown) in [(dirs::home_dir().unwrap(), "~"), ("/outside".into(), "/outside")] {
+        for (root, shown) in [(paths::home_dir().unwrap(), "~"), ("/outside".into(), "/outside")] {
             let source = Location::Local(root.join("work"));
             let dest = Location::Local(root.join("Docs"));
             for (action, message, verb, height) in [
@@ -601,6 +600,52 @@ mod tests {
             }
             let remote = Location::Remote(Remote { server: "web".into(), ssh_args: vec![], path: source.display() });
             assert_eq!(describe(&[remote]), format!("web:{}", root.join("work").display()));
+        }
+    }
+
+    #[test]
+    fn a_name_to_replace_starting_with_a_dash_is_not_an_option() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (owner, _peer) = client(&mut server);
+        let (sources, dest) = (vec![Location::Local("/a/-notes.txt".into())], Location::Local("/b".into()));
+        let replaces = vec!["-notes.txt".to_string()];
+        for action in [
+            FilesAction::Copy { sources: sources.clone(), dest: dest.clone(), replaces: replaces.clone() },
+            FilesAction::Move { sources: sources.clone(), dest: dest.clone(), replaces: replaces.clone() },
+        ] {
+            let Mode::Confirm(q) = server.files_action(owner, 1, action) else { panic!("confirmation") };
+            let ConfirmAction::Job { args, .. } = &q.action else { panic!("job") };
+            assert!(
+                args.contains(&"--allow=-notes.txt".to_string()) && !args.contains(&"--allow".to_string()),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_on_a_server_goes_to_a_home_path_not_yet_listed() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (owner, _peer) = client(&mut server);
+        let mut inv = crate::servers::Inventory::empty();
+        inv.servers =
+            vec![crate::servers::Server { name: "db".into(), host: "db.invalid".into(), ..Default::default() }];
+        server.known_servers = crate::servers::known(&inv, &[], &[]);
+        // As a panel holds them before (or without) a listing.
+        for spec in ["db:~/huge", "db:"] {
+            let place = server.files_location(spec);
+            server.files_action(owner, 1, FilesAction::Shell(place));
+        }
+        let scripts: Vec<String> = server
+            .panes
+            .values()
+            .filter(|p| p.spec.command.first().is_some_and(|c| c == "ssh"))
+            .map(|p| crate::shell::unwrap_sh_c(p.spec.command.last().unwrap()))
+            .collect();
+        for cd in ["cd -- \"$HOME\"/'huge' &&", "cd -- \"$HOME\" &&"] {
+            assert!(scripts.iter().any(|s| s.starts_with(cd)), "{scripts:?}");
         }
     }
 

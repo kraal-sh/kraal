@@ -449,12 +449,7 @@ pub fn review_question(account: &Account) -> String {
 }
 
 pub fn existing_label(agent: &str) -> String {
-    let name = match agent {
-        "claude" => "Claude",
-        "codex" => "Codex",
-        _ => agent,
-    };
-    format!("Existing {name} account")
+    format!("Existing {} account", crate::agent_registry::find(agent).map_or(agent, |a| a.label))
 }
 
 /// How an account is shown, e.g. `claude·pro`.

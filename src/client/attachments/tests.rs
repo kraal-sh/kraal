@@ -6,13 +6,14 @@ use crossbeam_channel::bounded;
 use ratatui::buffer::Buffer;
 
 use super::connection::send;
-use super::transfer::explicit_paths;
+use super::transfer::{dropped_paths, explicit_paths};
 use super::*;
 use crate::attachments::Source;
 use crate::client::clipboard_image::Diagnostic;
 use crate::protocol;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::server::overlays;
+use std::path::PathBuf;
 
 struct Size(usize, usize);
 impl alacritty_terminal::grid::Dimensions for Size {
@@ -636,6 +637,35 @@ fn pending_text_reads_cancel_on_control_c_focus_change_and_disconnect() {
 }
 
 #[test]
+fn a_focus_lost_before_the_text_read_starts_neither_panics_nor_pastes() {
+    // Cloning the reader runs between the offer's last focus check and the read.
+    struct Leave(Arc<Controller>);
+    impl Clone for Leave {
+        fn clone(&self) -> Self {
+            self.0.message(ServerMsg::ClipboardFocus { pane: None, agent: true });
+            Leave(self.0.clone())
+        }
+    }
+    for remote in [false, true] {
+        let (client, mut peer) = controller(remote);
+        client.connected();
+        client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+        let leave = Leave(client.clone());
+        client.input_with_clipboard(
+            b"\x16",
+            || Ok(false),
+            move |_, _| {
+                let _leave = &leave;
+                Ok(b"text".to_vec())
+            },
+        );
+        client.wait_for_reads();
+        assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"\x16".to_vec()));
+        assert!(peer.incoming.try_recv().is_err());
+    }
+}
+
+#[test]
 fn a_cancelled_text_read_cannot_replace_a_later_reads_result() {
     for remote in [false, true] {
         let (client, mut peer) = controller(remote);
@@ -1248,6 +1278,7 @@ fn image_buttons_cancel_with_keyboard_and_mouse_without_reading() {
         let view = client.state.lock().unwrap().view("fakehost").unwrap();
         assert_eq!(view.title, "Send the clipboard image to fakehost?");
         assert_eq!(view.buttons, ["Send", "Cancel"]);
+        assert_eq!(view.selected, 1, "the server can open it while Enter is typed");
         assert!(view.message.starts_with("Its path on fakehost goes to dev@anvil:~."));
         assert!(peer.incoming.try_recv().is_err());
         if mouse {
@@ -1256,7 +1287,7 @@ fn image_buttons_cancel_with_keyboard_and_mouse_without_reading() {
             let cancel = buttons[1];
             client.keys(format!("\x1b[<0;{};{}M", cancel.x + 1, cancel.y + 1).as_bytes());
         } else {
-            client.keys(b"\t\r");
+            client.keys(b"\r");
         }
         assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { .. }));
         assert!(client.state.lock().unwrap().active.is_none());
@@ -1370,7 +1401,8 @@ fn images_read_once_and_use_acknowledged_chunks_even_for_local_sessions() {
                     .unwrap()
             };
             if !shortcut || remote {
-                client.keys(b"\r");
+                // The offered image question opens on Cancel; a retry or Ctrl+V question on Send.
+                client.keys(if attempt == 0 && !shortcut { b"\t\r" } else { b"\r" });
             }
             let ClientMsg::AttachmentStart { files, .. } = read_without_repaint(&mut peer) else {
                 panic!("image did not use attachment transport")
@@ -1432,7 +1464,7 @@ fn images_read_once_and_use_acknowledged_chunks_even_for_local_sessions() {
             target: "pane".into(),
             limits: Default::default(),
         });
-        client.keys(b"\r");
+        client.keys(b"\t\r");
         let started = Instant::now();
         let pid: libc::pid_t = loop {
             if let Some(pid) = crate::testing::read_complete_lines(&ready).and_then(|text| text.trim().parse().ok()) {
@@ -2675,4 +2707,74 @@ fn a_recovered_result_cannot_cancel_a_new_batch() {
     assert!(!cancelled.load(Ordering::SeqCst));
     assert!(state.uncertain.is_none());
     assert!(state.status.is_none());
+}
+
+#[test]
+fn dropped_paths_handle_local_uris_quotes_and_unique_raw_names_without_shell_expansion() {
+    let t = crate::testing::TempDir::new("dropped-paths");
+    let names =
+        ["notes client.txt", "single'quote", "double\"quote", "back\\slash", "$literal", "brackets[1]", "café.png"];
+    for name in names {
+        let path = t.0.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(dropped_paths(&crate::shell::quote(path.to_str().unwrap())), Some(vec![path.clone()]));
+    }
+    let path = t.0.join("notes client.txt");
+    assert_eq!(dropped_paths(path.to_str().unwrap()), Some(vec![path.clone()]));
+    let uri = format!("file://{}", path.display().to_string().replace(' ', "%20"));
+    assert_eq!(dropped_paths(&uri), Some(vec![path.clone()]));
+    assert_eq!(dropped_paths(&format!("  '{uri}'\r\n'{}'\t", path.display())), Some(vec![path.clone(), path.clone()]));
+    for text in [
+        format!("cat {}", path.display()),
+        format!("{}\\", path.display()),
+        format!("'{}", path.display()),
+        format!("file://remote{}", path.display()),
+        format!("{uri}%"),
+        format!("{uri}%00"),
+        format!("{uri}?query"),
+        format!("{uri}#fragment"),
+        format!("{}/$literal", t.0.display()),
+        format!("{}/brackets[1]", t.0.display()),
+        "/$(touch /tmp/no)".into(),
+        "relative".into(),
+        String::new(),
+    ] {
+        assert_eq!(dropped_paths(&text), None, "{text}");
+    }
+    let a = t.0.join("a");
+    let b = t.0.join("b");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let text = format!("{} {}", a.display(), b.display());
+    let raw = PathBuf::from(&text);
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"ambiguous").unwrap();
+    assert_eq!(dropped_paths(&text), None);
+    assert_eq!(dropped_paths(&format!("'{}' '{}'", a.display(), b.display())), Some(vec![a, b]));
+    assert_eq!(dropped_paths(&format!("'{text}'")), Some(vec![raw]));
+    let c = t.0.join("c");
+    std::fs::write(&c, b"c").unwrap();
+    assert_eq!(dropped_paths(&format!("{text} {}", c.display())), None);
+    assert_eq!(dropped_paths(&format!("'{}' {text}", c.display())), None);
+    let backslash = t.0.join("back\\slash");
+    assert_eq!(dropped_paths(&format!("\"{}\"", backslash.display())), Some(vec![backslash]));
+}
+
+#[test]
+fn dropped_paths_parsing() {
+    let dir = std::env::temp_dir().join(format!("kraal drop {}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("it's here.txt");
+    std::fs::write(&f, "x").unwrap();
+    let escaped = f.display().to_string().replace(' ', "\\ ").replace('\'', "\\'");
+    assert_eq!(dropped_paths(&escaped), Some(vec![f.clone()]));
+    let quoted = format!("'{}' {}", dir.display(), escaped);
+    assert_eq!(dropped_paths(&quoted), Some(vec![dir.clone(), f.clone()]));
+    assert_eq!(dropped_paths("echo hello"), None);
+    assert_eq!(dropped_paths("relative/path"), None);
+    assert_eq!(
+        dropped_paths(&format!("file://{}", dir.display().to_string().replace(' ', "\\ "))),
+        Some(vec![dir.clone()])
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

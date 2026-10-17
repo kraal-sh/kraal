@@ -185,7 +185,7 @@ fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| dirs::home_dir().map(|h| h.join(fallback)))
+        .or_else(|| home_dir().map(|h| h.join(fallback)))
         .unwrap_or_else(std::env::temp_dir)
 }
 
@@ -244,6 +244,13 @@ pub fn buffers_path(session: &str) -> PathBuf {
     state_dir().join("buffers").join(format!("{session}.json"))
 }
 
+/// Where a buffers' file of `session` that could not be read back may be kept aside, the first
+/// free one taken: `<session>.json.bad`, then `.bad.1` to `.bad.9`.
+pub fn buffers_aside_paths(session: &str) -> impl Iterator<Item = PathBuf> {
+    let path = buffers_path(session);
+    (0..10).map(move |n| path.with_extension(if n == 0 { "json.bad".into() } else { format!("json.bad.{n}") }))
+}
+
 /// The log of `session`'s server, which runs detached from any terminal: its standard output and
 /// error, and those of a restart run on its own ([`crate::client::restart_detached`]).
 pub fn log_path(session: &str) -> PathBuf {
@@ -263,22 +270,43 @@ pub fn workspaces_dir() -> PathBuf {
     config_dir().join("workspaces")
 }
 
+/// The home directory: `HOME`, else the password database's. Never empty: an empty `HOME`
+/// names no directory.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|home| !home.as_os_str().is_empty())
+}
+
 /// Expand a leading `~` or `~/` to the home directory. `~user` is left as it is.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+        return home_dir().unwrap_or_else(|| PathBuf::from(path));
     }
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = home_dir()
     {
         return home.join(rest);
     }
     PathBuf::from(path)
 }
 
+/// `path` with its `.` and `..` worked out from the text alone.
+pub fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Replace the home directory prefix with `~` for display.
 pub fn shorten_home(path: &Path) -> String {
-    let Some(home) = dirs::home_dir() else { return path.display().to_string() };
+    let Some(home) = home_dir() else { return path.display().to_string() };
     shorten_home_in(path, &home)
 }
 
@@ -304,7 +332,7 @@ pub fn of_the_developer() -> Option<String> {
     let keep_out = std::env::var_os("KRAAL_TEST_KEEP_OUT")?;
     let followed = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let own = [
-        ("HOME", dirs::home_dir()),
+        ("HOME", home_dir()),
         ("the configuration directory", Some(config_dir())),
         ("the state directory", Some(state_dir())),
         ("the data directory", Some(data_home())),

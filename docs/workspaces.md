@@ -412,7 +412,7 @@ and the directories `workspace_dirs` names also appear in Workspaces. The picker
 error for an invalid file; `kraal workspaces --json` omits that file. The full sidebar and
 compact strip show valid files from the last source scan. Drawing them does not rescan or
 reload those files. Automatic scans read KDL files in the background only when their inputs
-may have changed, a scan was requested again, or a previous scan failed. The periodic check
+may have changed, a scan was requested again, or a previous read failed. The periodic check
 compares metadata and directory listings, including sources linked from outside the configured
 directories. See [Configuration](configuration.md) for the scan timing.
 A source associated with a workspace already listed does not add another row.

@@ -181,7 +181,7 @@ pub fn reconcile(
         return Ok(Some(format!(
             "{} is {} · {}",
             crate::paths::shorten_home(&crate::paths::expand_tilde(&existing.home)),
-            if target.agent == "claude" { "Claude" } else { "Codex" },
+            crate::agent_registry::find(&target.agent).map_or(target.agent.as_str(), |a| a.label),
             target.name
         )));
     }

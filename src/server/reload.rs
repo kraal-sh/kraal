@@ -31,6 +31,11 @@ impl Inventories {
         };
         Self { accounts: Accounts::load(), servers: Inventory::load(), hosts, hosts_failed }
     }
+
+    fn failed(&self) -> bool {
+        use super::config_scan::retryable;
+        self.accounts.as_ref().is_err_and(retryable) || self.servers.as_ref().is_err_and(retryable) || self.hosts_failed
+    }
 }
 
 impl Server {
@@ -52,8 +57,7 @@ impl Server {
         let mut inputs = Inputs::configuration();
         let definitions = self.prepare_definition_scan().read(&mut inputs);
         let read = Inventories::read(self.config.ssh_config_hosts, &mut inputs);
-        self.config_scan_failed =
-            definitions.failed() || read.servers.is_err() || read.accounts.is_err() || read.hosts_failed;
+        self.config_scan_failed = definitions.failed() || read.failed();
         let defs = self.apply_definition_scan(definitions, true);
         self.apply_known(&defs, read.servers, &read.hosts);
         self.apply_accounts(read.accounts);
@@ -91,14 +95,18 @@ impl Server {
                 let stale = generation != server.config_generation;
                 let changed = inputs.scope_changed(server) || inputs.changed().unwrap_or(false);
                 if !stale {
-                    server.config_scan_failed =
-                        definitions.failed() || read.servers.is_err() || read.accounts.is_err() || read.hosts_failed;
+                    server.config_scan_failed = definitions.failed() || read.failed();
+                    let (known, accounts, error) =
+                        (server.known_servers.clone(), server.accounts.clone(), server.accounts_error.clone());
                     let defs = server.apply_definition_scan(definitions, !changed);
                     server.apply_known(&defs, read.servers, &read.hosts);
                     server.apply_accounts(read.accounts);
                     inputs.follow_sources(server);
                     server.config_inputs = Some(inputs);
-                    server.mark_dirty();
+                    // Definitions and their sources mark their own changes.
+                    if known != server.known_servers || accounts != server.accounts || error != server.accounts_error {
+                        server.mark_dirty();
+                    }
                 }
                 if std::mem::take(&mut server.config_scan_again) || stale || changed {
                     server.scan_definitions_async();
@@ -214,7 +222,7 @@ mod tests {
         if !crate::testing::in_own_process("server::reload::tests::every_scanned_file_triggers_one_scan_per_change") {
             return;
         }
-        let home = dirs::home_dir().unwrap();
+        let home = crate::paths::home_dir().unwrap();
         let extra = home.join("extra");
         let external = home.join("external/source.kdl");
         let ssh = home.join(".ssh");
@@ -275,7 +283,7 @@ mod tests {
         if !crate::testing::in_own_process("server::reload::tests::directory_changes_and_symlink_targets_are_scanned") {
             return;
         }
-        let home = dirs::home_dir().unwrap();
+        let home = crate::paths::home_dir().unwrap();
         let ssh = home.join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
         std::fs::write(ssh.join("config"), "Include config.d/*\n").unwrap();
@@ -490,7 +498,7 @@ mod tests {
         ) {
             return;
         }
-        let path = dirs::home_dir().unwrap().join("external.kdl");
+        let path = crate::paths::home_dir().unwrap().join("external.kdl");
         std::fs::write(&path, "layout { pane; }\n").unwrap();
         let (tx, rx) = crate::server::event_channel(32);
         let mut server = server(tx);
@@ -513,7 +521,7 @@ mod tests {
         if !crate::testing::in_own_process("server::reload::tests::disabled_ssh_hosts_do_not_add_scan_inputs") {
             return;
         }
-        let ssh = dirs::home_dir().unwrap().join(".ssh");
+        let ssh = crate::paths::home_dir().unwrap().join(".ssh");
         std::fs::create_dir_all(ssh.join("config.d")).unwrap();
         std::fs::write(ssh.join("config"), "Include config.d/*\n").unwrap();
         let (tx, rx) = crate::server::event_channel(32);
@@ -533,7 +541,7 @@ mod tests {
         if !crate::testing::in_own_process("server::reload::tests::failed_ssh_reads_recover_without_metadata_changes") {
             return;
         }
-        let ssh = dirs::home_dir().unwrap().join(".ssh");
+        let ssh = crate::paths::home_dir().unwrap().join(".ssh");
         std::fs::create_dir_all(ssh.join("config.d")).unwrap();
         for synchronous in [false, true] {
             for source in ["config", "included", "config.d/host"] {
@@ -600,21 +608,51 @@ mod tests {
         until(&mut server, &rx, |s| s.config_scan.upgrade().is_none());
         assert!(server.config_scan_failed);
         one_scan(&mut server, &rx);
-        for metadata_error in [false, true] {
-            if metadata_error {
-                std::os::unix::fs::symlink(Accounts::path(), Accounts::path()).unwrap();
-            } else {
-                std::fs::write(Accounts::path(), "not valid TOML").unwrap();
-            }
-            for _ in 0..2 {
-                let before = server.next_id;
-                server.check_definitions();
-                until(&mut server, &rx, |s| s.config_scan.upgrade().is_none());
-                assert_eq!(server.next_id, before + 1);
-                assert!(server.config_scan_failed);
-            }
-            std::fs::remove_file(Accounts::path()).unwrap();
+        std::os::unix::fs::symlink(Accounts::path(), Accounts::path()).unwrap();
+        for _ in 0..2 {
+            let before = server.next_id;
+            server.check_definitions();
+            until(&mut server, &rx, |s| s.config_scan.upgrade().is_none());
+            assert_eq!(server.next_id, before + 1);
+            assert!(server.config_scan_failed);
+        }
+        std::fs::remove_file(Accounts::path()).unwrap();
+        one_scan(&mut server, &rx);
+    }
+
+    #[test]
+    fn unchanged_invalid_contents_wait_for_a_change() {
+        if !crate::testing::in_own_process("server::reload::tests::unchanged_invalid_contents_wait_for_a_change") {
+            return;
+        }
+        std::fs::create_dir_all(crate::paths::workspaces_dir()).unwrap();
+        let kdl = crate::paths::workspaces_dir().join("broken.kdl");
+        for (path, valid, applied) in
+            [(kdl, "layout { pane; }", (1, 90)), (Accounts::path(), "[limits]\nthreshold = 81\n", (0, 81))]
+        {
+            std::fs::write(&path, "layout {").unwrap();
+            let (tx, rx) = crate::server::event_channel(32);
+            let mut server = server(tx);
+            server.config.ssh_config_hosts = false;
+            let (id, _peer) = client(&mut server);
+            server.scan_definitions();
+            until(&mut server, &rx, |s| s.jobs.is_empty());
+            assert!(!server.config_scan_failed, "{}", path.display());
+            let before = server.next_id;
+            server.check_definitions();
+            assert_eq!(server.next_id, before, "a parse error cannot go away without a change");
+            server.clients.get_mut(&id).unwrap().dirty = crate::server::Dirty::No;
+            server.config_scan_again = true;
             one_scan(&mut server, &rx);
+            assert_eq!(server.clients[&id].dirty, crate::server::Dirty::No, "nothing changed");
+            std::fs::write(&path, valid).unwrap();
+            let before = server.next_id;
+            server.check_definitions();
+            // Valid accounts also start their own checks: count the scan alone.
+            assert_eq!(server.next_id, before + 1, "the fixed file is read");
+            until(&mut server, &rx, |s| s.config_scan.upgrade().is_none());
+            assert_eq!((server.def_files.len(), server.accounts.limits.threshold), applied);
+            std::fs::remove_file(&path).unwrap();
         }
     }
 

@@ -20,6 +20,10 @@ mod view;
 
 type Writer = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
+/// Requests waiting behind a question or a transfer, and the path bytes they may hold.
+const QUEUED: usize = 16;
+const QUEUED_BYTES: usize = 64 << 20;
+
 #[derive(Clone)]
 struct Request {
     to_laptop: bool,

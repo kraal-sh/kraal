@@ -65,8 +65,11 @@ pub(crate) fn split_remote(s: &str) -> Option<(&str, &str)> {
     if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with('~') {
         return None;
     }
-    // `[v6]:path` and `user@[v6]:path`
-    if let Some(close) = s.find("]:") {
+    // `[v6]:path` and `user@[v6]:path`; a `]:` in a path is not an address.
+    let host = s.split_once('@').filter(|(user, _)| !user.contains([':', '/'])).map_or(s, |(_, host)| host);
+    if host.starts_with('[')
+        && let Some(close) = s.find("]:")
+    {
         return Some((&s[..close + 1], &s[close + 2..]));
     }
     let (head, path) = s.split_once(':')?;
@@ -255,24 +258,6 @@ fn notes_dir() -> PathBuf {
     crate::paths::state_dir().join("transfers")
 }
 
-/// An exclusive flock(2) on `file`; `false` when another holds it and `wait` is false.
-fn flock(file: &std::fs::File, wait: bool) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let how = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
-    loop {
-        // SAFETY: flock on a descriptor we own; released when it is closed.
-        if unsafe { libc::flock(file.as_raw_fd(), how) } == 0 {
-            return Ok(true);
-        }
-        let e = std::io::Error::last_os_error();
-        match e.kind() {
-            std::io::ErrorKind::Interrupted => continue,
-            std::io::ErrorKind::WouldBlock => return Ok(false),
-            _ => return Err(e),
-        }
-    }
-}
-
 fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -292,7 +277,7 @@ fn hold_lock(path: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> 
     use std::os::unix::fs::MetadataExt;
     loop {
         let file = open_lock(path)?;
-        if !flock(&file, wait)? {
+        if !crate::paths::flock(&file, wait)? {
             return Ok(None);
         }
         let held = file.metadata()?;
@@ -440,6 +425,30 @@ fn transfer_key(sources: &[Endpoint], dest: &Endpoint) -> u64 {
 /// Shell function `up PATH`: sets `$P` to the directory holding PATH (given without trailing
 /// slashes). Unlike `$(dirname …)`, a name ending in a newline keeps it.
 const UP: &str = "up() { case $1 in */*) P=${1%/*}; [ -n \"$P\" ] || P=/ ;; *) P=. ;; esac; }; ";
+
+/// Shell function `merge FROM DIR` (with [`DEV`]): moves what FROM holds into DIR as tar would
+/// unpack it there. A directory goes into the one of its name; anything else takes its name in one
+/// rename (a file or link where a directory goes is removed first). A directory merged into takes
+/// the archived mode before anything goes in, its owner using it until it is filled, or receives
+/// nothing (another's: its mode would not keep what goes in private), and keeps the archived time;
+/// one moved whole is writable while it moves (a directory's `..` changes). FROM is made readable
+/// and searchable too: an archived 0400 directory would hide what it holds. Nothing goes to another
+/// file system (a mount point inside DIR): `mv` would copy over what is there, and a full disk
+/// would leave it cut short. A file or link takes the place of an empty directory, as with tar.
+/// What cannot be put in place makes it fail, and the rest goes on, as with tar. FROM is emptied: it is made writable.
+const MERGE: &str = "mode() { stat -L -c %a -- \"$1\" 2>/dev/null || stat -L -f %Lp -- \"$1\"; }; \
+     merge() { chmod u+rwx \"$1\" 2>/dev/null; e=0; \
+     for f in \"$1\"/* \"$1\"/.[!.]* \"$1\"/..?*; do [ -e \"$f\" ] || [ -L \"$f\" ] || continue; o=$2/${f##*/}; \
+     if [ -d \"$f\" ] && [ ! -L \"$f\" ] && [ -d \"$o\" ] && [ ! -L \"$o\" ]; then \
+     m=$(mode \"$f\"); r=$(mktemp) && touch -r \"$f\" \"$r\" || r=; \
+     if chmod \"$m\" \"$o\" && chmod u+rwx \"$o\"; then ( merge \"$f\" \"$o\" ) || e=1; \
+     chmod \"$m\" \"$o\" || e=1; else e=1; fi; [ -z \"$r\" ] || { touch -r \"$r\" \"$o\" 2>/dev/null; rm -f -- \"$r\"; }; \
+     continue; fi; \
+     if [ \"$(dev \"$f\")\" != \"$(devl \"$2\")\" ]; then printf '%s: on another file system, not put there\\n' \"$o\" >&2; \
+     e=1; continue; fi; \
+     if [ -d \"$f\" ] && [ ! -L \"$f\" ]; then rm -f -- \"$o\"; \
+     m=$(mode \"$f\"); chmod u+rwx \"$f\" && mv -f -- \"$f\" \"$2\"/ && chmod \"$m\" \"$o\" || e=1; continue; fi; \
+     { [ ! -d \"$o\" ] || [ -L \"$o\" ] || rmdir -- \"$o\" 2>/dev/null; }; mv -f -- \"$f\" \"$2\"/ || e=1; done; return $e; }; ";
 
 /// Shell functions `dev PATH`, the device PATH itself is on (a link: where the link is), and
 /// `devl PATH`, the device of what PATH leads to (a link to a directory: that directory's), with
@@ -812,7 +821,8 @@ fn plan_group(
             let mut right = ssh(to);
             right.push(to.destination());
             let dest_dir = remote_abs_dir(&remote_path(to_path));
-            right.push(crate::shell::sh_c(&unpack_script(&dest_dir, single.as_deref())));
+            let root = matches!(&remote_paths()[..], [p] if contents_of(p).is_some());
+            right.push(crate::shell::sh_c(&unpack_script(&dest_dir, single.as_deref(), root)));
             let mut step = Step::new("ssh", left);
             step.pipe_to = Some(Box::new(Step::new("ssh", right)));
             Ok(vec![step])
@@ -846,8 +856,9 @@ fn word_or_dash(s: &str) -> &str {
 /// (` pid:? ` when the system does not say when one started). A staging directory made on this
 /// machine and boot is over only when its maker started before this process and is not among
 /// them: it had ended by the time the list was made. One whose maker started later may well run
-/// though the list, made before, does not show it: it is kept.
-fn live_processes() -> String {
+/// though the list, made before, does not show it: it is kept. `None` when they are too many for
+/// the script that gets them (Linux refuses an argument over 128 KiB): then each is kept.
+fn live_processes() -> Option<String> {
     let mut out = String::from(" ");
     for pid in crate::process::pids() {
         match crate::process::start_time(pid) {
@@ -855,7 +866,15 @@ fn live_processes() -> String {
             None => out.push_str(&format!("{pid}:? ")),
         }
     }
-    out
+    #[cfg(test)]
+    out.push_str(&MORE_PROCESSES.take());
+    (out.len() <= 64 * 1024).then_some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Words [`live_processes`] adds to the processes running here.
+    static MORE_PROCESSES: std::cell::Cell<String> = const { std::cell::Cell::new(String::new()) };
 }
 
 /// Sources that must not replace anything: copied into a private staging directory in the
@@ -952,6 +971,9 @@ fn plan_staged(
         ),
         Endpoint::Local(_) => String::new(),
     };
+    // Without the list, `since` is empty: no staging made on this boot is judged over.
+    let live = live_processes();
+    let since = live.as_ref().and(crate::process::start_time(std::process::id()));
     let prepare = format!(
         "{directories}d={final_dir}; s={stage_word}; me={machine}; boot={boot}; since={since}; live={live}; \
          mkdir -p -- \"$d\" || exit 1; \
@@ -973,10 +995,8 @@ fn plan_staged(
          || {{ echo \"could not prepare $s: nothing was done\" >&2; exit 1; }}",
         machine = crate::shell::quote(&machine),
         boot = crate::shell::quote(&boot),
-        since = crate::shell::quote(
-            &crate::process::start_time(std::process::id()).map(|s| s.to_string()).unwrap_or_default()
-        ),
-        live = crate::shell::quote(&live_processes()),
+        since = crate::shell::quote(&since.map(|s| s.to_string()).unwrap_or_default()),
+        live = crate::shell::quote(live.as_deref().unwrap_or_default()),
         hex = "[0-9a-f]".repeat(32),
         format = crate::shell::quote(STAGE_FORMAT),
         owner = crate::shell::quote(owner.as_deref().unwrap_or("unknown")),
@@ -1218,9 +1238,36 @@ fn contents_of(p: &str) -> Option<String> {
 
 /// Shell script that unpacks a tar stream from stdin into `dest` (a shell word). As with rsync,
 /// an existing directory (or a name ending in `/`, or several sources: `single` is `None`)
-/// receives the sources; otherwise the one source takes `dest` as its name.
-fn unpack_script(dest: &str, single: Option<&str>) -> String {
-    let into = format!("mkdir -p -- {dest} && tar xf - -C {dest}");
+/// receives the sources; otherwise the one source takes `dest` as its name. The stream is
+/// unpacked whole into a private directory first: a broken one replaces nothing. `root`: the
+/// stream is the contents of one directory (`dir/`).
+fn unpack_script(dest: &str, single: Option<&str>, root: bool) -> String {
+    // Unpacked into `x` inside the private staging: a stream's `.` may give `x` any mode (0777),
+    // and others must not put anything in what is about to be published.
+    let into = if root {
+        // The stream's `.` is the directory whose contents are copied (`dir/`): `dest` takes its
+        // mode before anything goes in, or receives nothing; open to its owner meanwhile (a copy
+        // made it read-only, or 0400), and given back the mode it keeps on every way out. GNU tar
+        // gives `x` `.`'s mode and time, which `dest` then takes; busybox's never does, nor BSD tar
+        // to a directory already there: `dest` keeps its own. `keep`, `tm`: merge's variables are
+        // everyone's.
+        format!(
+            "{DEV}{MERGE}mkdir -p -- {dest} && keep=$(mode {dest}) || exit 1; t=; tm=; \
+             chmod u+rwx {dest} && t=$(mktemp -d {dest}/.kraal-XXXXXX) && mkdir \"$t/x\" \
+             || {{ [ -z \"$t\" ] || rm -rf -- \"$t\"; chmod \"$keep\" {dest}; exit 1; }}; tar xf - -C \"$t/x\"; s=$?; \
+             if [ $s = 0 ]; then tar --version 2>/dev/null | grep -q 'GNU tar' && keep=$(mode \"$t/x\") \
+             && tm=$(mktemp) && touch -r \"$t/x\" \"$tm\"; \
+             chmod \"$keep\" {dest} && chmod u+rwx {dest} && merge \"$t/x\" {dest} || s=1; fi; \
+             rm -rf -- \"$t\"; chmod \"$keep\" {dest} || s=1; \
+             [ -z \"$tm\" ] || {{ touch -r \"$tm\" {dest}; rm -f -- \"$tm\"; }}; exit $s"
+        )
+    } else {
+        format!(
+            "{DEV}{MERGE}t=; mkdir -p -- {dest} && t=$(mktemp -d {dest}/.kraal-XXXXXX) && mkdir \"$t/x\" \
+             || {{ [ -z \"$t\" ] || rm -rf -- \"$t\"; exit 1; }}; tar xf - -C \"$t/x\"; s=$?; \
+             if [ $s = 0 ]; then merge \"$t/x\" {dest} || s=1; fi; rm -rf -- \"$t\"; exit $s"
+        )
+    };
     let Some(name) = single else { return into };
     let name = crate::shell::quote(name);
     format!(
@@ -1243,7 +1290,8 @@ fn upload_tar(
 ) -> Result<Step> {
     let mut right = ssh_opts.to_vec();
     right.push(server.destination());
-    right.push(crate::shell::sh_c(&unpack_script(&remote_abs_dir(&remote_path(path)), single)));
+    let root = matches!(sources, [s] if source_name(s)?.1);
+    right.push(crate::shell::sh_c(&unpack_script(&remote_abs_dir(&remote_path(path)), single, root)));
     let mut step = pack_local(sources)?;
     step.pipe_to = Some(Box::new(Step::new("ssh", right)));
     Ok(step)
@@ -1269,13 +1317,18 @@ fn download_tar(
     left.push(crate::shell::sh_c(&pack_remote(&paths)));
     let dest = crate::shell::quote_always(&dest.display().to_string());
     let mut step = Step::new("ssh", left);
-    step.pipe_to = Some(Box::new(Step::new("sh", vec!["-c".into(), unpack_script(&dest, single)])));
+    let root = matches!(&paths[..], [p] if contents_of(p).is_some());
+    step.pipe_to = Some(Box::new(Step::new("sh", vec!["-c".into(), unpack_script(&dest, single, root)])));
     Ok(step)
 }
 
-/// `-e` value for rsync: the ssh command with its options.
+/// `-e` value for rsync: the ssh command with its options, quoted as rsync splits it (no shell:
+/// quotes group, a quote doubled inside them is one, a backslash is a backslash).
 fn ssh_e(opts: &[String]) -> String {
-    crate::shell::join(&[&["ssh".to_string()], opts].concat())
+    let word = |w: &String| {
+        if !w.is_empty() && !w.contains([' ', '\'', '"']) { w.clone() } else { format!("'{}'", w.replace('\'', "''")) }
+    };
+    std::iter::once("ssh".to_string()).chain(opts.iter().map(word)).collect::<Vec<_>>().join(" ")
 }
 
 /// A remote path for the remote shell: relative paths stay relative to home.
@@ -1283,12 +1336,13 @@ fn remote_shell_path(p: &str) -> String {
     if p.is_empty() { ".".to_string() } else { crate::shell::quote(p) }
 }
 
-/// A remote directory for the remote shell, always absolute (relative ones are under home).
+/// A remote directory for the remote shell, always absolute: `p` is as [`remote_path`] gives it,
+/// relative to home (`~/` is already gone: what remains is a name, such as a directory `~`).
 fn remote_abs_dir(p: &str) -> String {
     match p {
-        "" | "." | "~" => "\"$HOME\"".to_string(),
+        "" | "." => "\"$HOME\"".to_string(),
         _ if p.starts_with('/') => crate::shell::quote(p),
-        _ => format!("\"$HOME\"/{}", crate::shell::quote(p.trim_start_matches("~/"))),
+        _ => format!("\"$HOME\"/{}", crate::shell::quote(p)),
     }
 }
 
@@ -1330,17 +1384,18 @@ pub fn existing_in(sources: &[Endpoint], dest: &Endpoint, ssh: SshOptions) -> Re
         },
         Endpoint::Remote { server, path } => {
             let quoted: Vec<String> = names.iter().map(|n| crate::shell::quote(n)).collect();
-            let d = remote_abs_dir(trim_dir(path));
+            let d = remote_abs_dir(trim_dir(&remote_path(path)));
             let script = format!(
                 "if [ ! -e {d} ] && [ ! -L {d} ]; then exit 0; fi; \
                  if [ ! -d {d} ]; then echo 'is a file: copying would replace it' >&2; exit 3; fi; \
                  cd -- {d} || exit 3; \
-                 for f in {}; do if [ -e \"$f\" ] || [ -L \"$f\" ]; then printf '%s\\n' \"$f\"; fi; done",
+                 for f in {}; do if [ -e \"$f\" ] || [ -L \"$f\" ]; then printf '%s\\0' \"$f\"; fi; done",
                 quoted.join(" ")
             );
             let out =
                 remote_output(server, ssh, &script).with_context(|| format!("could not check {}", dest.display()))?;
-            Ok(out.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+            // NUL-separated: a name may hold a newline or end in `\r`.
+            Ok(out.split('\0').filter(|l| !l.is_empty()).map(str::to_string).collect())
         }
     }
 }
@@ -1716,12 +1771,20 @@ pub fn removal_plan(targets: &[Endpoint]) -> Result<RemovalPlan> {
     for t in targets {
         match t {
             Endpoint::Local(p) => {
-                std::fs::symlink_metadata(p).with_context(|| format!("{}", p.display()))?;
+                let meta = std::fs::symlink_metadata(p).with_context(|| format!("{}", p.display()))?;
+                // `/`, `.` and `..` have no name; `/` and home can have other names, through links.
+                let top = |c: PathBuf| {
+                    c == Path::new("/") || crate::paths::home_dir().and_then(|h| h.canonicalize().ok()) == Some(c)
+                };
+                if p.file_name().is_none() || (meta.is_dir() && p.canonicalize().is_ok_and(top)) {
+                    bail!("refusing to delete {}", p.display());
+                }
                 local.push(p.clone());
             }
             Endpoint::Remote { server, path } => {
                 let path = remote_path(path);
-                if path.is_empty() || path == "/" || path == "." {
+                // Home (`~` is ""), `/`, `.` and `..`, however written (`//`, `./`, `/.`).
+                if Path::new(&path).file_name().is_none() {
                     bail!("refusing to delete {}:{path}", server.name);
                 }
                 match remote.iter_mut().find(|(s, _)| s.same_connection(server)) {
@@ -1734,6 +1797,23 @@ pub fn removal_plan(targets: &[Endpoint]) -> Result<RemovalPlan> {
     Ok(RemovalPlan { local, remote })
 }
 
+/// Shell script that deletes `paths` on a server (relative ones are under home), or none of them
+/// when one is a directory that is `/` or home under another name (`/home/me`, `link/`); a link
+/// to one is only a link.
+fn removal_script(paths: &[String]) -> String {
+    let mut script = String::from("set --");
+    for p in paths {
+        script.push(' ');
+        script.push_str(&remote_abs_dir(p));
+    }
+    // Compared as files, not names: `//home/me`, `/home/me/.` and `link/` are home too.
+    script.push_str(
+        "; for p; do if [ -d \"$p\" ] && [ ! -L \"$p\" ] && { [ \"$p\" -ef / ] || [ \"$p\" -ef \"$HOME\" ]; }; \
+         then printf 'refusing to delete %s\\n' \"$p\" >&2; exit 1; fi; done; rm -rf -- \"$@\"",
+    );
+    script
+}
+
 /// Delete local paths and remote paths.
 pub fn remove(targets: &[Endpoint], ssh: SshOptions) -> Result<()> {
     let RemovalPlan { local, remote } = removal_plan(targets)?;
@@ -1743,24 +1823,15 @@ pub fn remove(targets: &[Endpoint], ssh: SshOptions) -> Result<()> {
             .with_context(|| format!("deleting {}", p.display()))?;
     }
     for (server, paths) in remote {
-        let mut line = String::from("rm -rf --");
-        for p in &paths {
-            line.push(' ');
-            line.push_str(&crate::shell::quote(p));
-        }
         let mut args = ssh(&server);
         args.push(server.destination());
-        args.push(crate::shell::sh_c(&line));
+        args.push(crate::shell::sh_c(&removal_script(&paths)));
         let status = std::process::Command::new("ssh").args(&args).status().context("running ssh")?;
         if !status.success() {
             bail!("deleting on {} failed ({status})", server.name);
         }
     }
     Ok(())
-}
-
-pub fn have_program(name: &str) -> bool {
-    std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).any(|d| d.join(name).is_file())).unwrap_or(false)
 }
 
 /// Run `step`, piped into its `pipe_to` if any: the status of the first that failed.
@@ -1919,121 +1990,6 @@ fn run_inner(steps: &[Step], laptop_install: bool) -> Result<()> {
     Ok(())
 }
 
-/// Recognize complete local path lists without expanding shell expressions.
-pub fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
-    if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
-        return None;
-    }
-    let text = text.trim();
-    let mut words = Vec::new();
-    let mut cur = String::new();
-    let mut in_word = false;
-    let mut chars = text.chars().peekable();
-    let mut quote = None;
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('"'), '\\') => {
-                let next = chars.next()?;
-                if !matches!(next, '"' | '\\' | '$' | '`') {
-                    cur.push('\\');
-                }
-                cur.push(next);
-            }
-            (Some('"') | None, '$' | '`') => return None,
-            (Some(_), c) => cur.push(c),
-            (None, '\'' | '"') => {
-                quote = Some(c);
-                in_word = true;
-            }
-            (None, '\\') => {
-                cur.push(chars.next()?);
-                in_word = true;
-            }
-            (None, '*' | '?' | '[' | ']' | ';' | '|' | '&' | '<' | '>' | '(' | ')') => return None,
-            (None, c) if c.is_whitespace() => {
-                if in_word {
-                    words.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
-            (None, c) => {
-                cur.push(c);
-                in_word = true;
-            }
-        }
-    }
-    if quote.is_some() {
-        return None;
-    }
-    if in_word {
-        words.push(cur);
-    }
-    let parsed =
-        words.into_iter().map(|word| local_path(&word)).collect::<Option<Vec<_>>>().filter(|paths| !paths.is_empty());
-    // Some terminals leave spaces unquoted. Never choose between a whole name and a list.
-    let raw = (!text.contains(['\'', '"', '\\', '\n', '\r', '\t']))
-        .then(|| local_path(text))
-        .flatten()
-        .map(|path| vec![path]);
-    if parsed.is_some() {
-        let words: Vec<_> = text.split_whitespace().collect();
-        for (i, word) in words.iter().enumerate() {
-            let start = word.as_ptr() as usize - text.as_ptr() as usize;
-            let Some(next) = words.get(i + 1) else { break };
-            let next_start = next.as_ptr() as usize - text.as_ptr() as usize;
-            // Joining absolute words would need a directory whose name includes the separator.
-            if !Path::new(&text[start..next_start]).is_dir() {
-                continue;
-            }
-            for last in &words[i + 1..] {
-                let last_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
-                if last_end - start > 4096 {
-                    break;
-                }
-                let joined = &text[start..last_end];
-                if !joined.contains(['\'', '"', '\\', '\n', '\r', '\t']) && local_path(joined).is_some() {
-                    return None;
-                }
-            }
-        }
-    }
-    match (parsed, raw) {
-        (Some(a), Some(b)) if a != b => None,
-        (Some(paths), _) | (_, Some(paths)) => Some(paths),
-        _ => None,
-    }
-}
-
-fn local_path(word: &str) -> Option<PathBuf> {
-    let decoded;
-    let word = if let Some(uri) = word.strip_prefix("file://") {
-        if !uri.starts_with('/') || uri.contains(['?', '#']) {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        let mut input = uri.bytes();
-        while let Some(byte) = input.next() {
-            bytes.push(if byte == b'%' {
-                let hi = char::from(input.next()?).to_digit(16)?;
-                let lo = char::from(input.next()?).to_digit(16)?;
-                (hi * 16 + lo) as u8
-            } else {
-                byte
-            });
-        }
-        decoded = String::from_utf8(bytes).ok()?;
-        decoded.as_str()
-    } else {
-        word
-    };
-    if word.chars().any(char::is_control) {
-        return None;
-    }
-    let path = PathBuf::from(word);
-    (path.is_absolute() && std::fs::symlink_metadata(&path).is_ok()).then_some(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2114,6 +2070,55 @@ mod tests {
         assert!(remove(&bad, &|_| Vec::new()).is_err());
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removal_refuses_the_root_home_and_the_current_directory() {
+        let web = Server { name: "web".into(), host: "web.lan".into(), ..Default::default() };
+        let mut targets = vec![Endpoint::Local(".".into()), Endpoint::Local("/".into())];
+        targets.extend(crate::paths::home_dir().map(Endpoint::Local));
+        for path in ["//", "~/", "~/./", "/.", "a/.."] {
+            targets.push(Endpoint::Remote { server: web.clone(), path: path.into() });
+        }
+        for t in targets {
+            assert!(removal_plan(std::slice::from_ref(&t)).is_err(), "{t:?}");
+        }
+        assert!(removal_plan(&[Endpoint::Remote { server: web, path: "~/old/".into() }]).is_ok());
+    }
+
+    #[test]
+    fn remote_removal_refuses_home_under_another_name() {
+        let t = Tmp::new("rm-home");
+        let home = t.dir.0.join("home");
+        t.write("home/precious", "data");
+        t.write("home/old/x", "gone");
+        t.write("home/-x/y", "gone");
+        std::os::unix::fs::symlink(&home, home.join("link")).unwrap();
+        let rm = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            std::process::Command::new("sh")
+                .args(["-c", &removal_script(&paths)])
+                .env("HOME", &home)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        // Home spelled absolutely, or through a link with a trailing `/`: nothing is deleted.
+        assert!(!rm(&["old", &home.display().to_string()]));
+        assert!(!rm(&["link/"]));
+        assert_eq!((t.read("home/old/x").as_str(), t.read("home/precious").as_str()), ("gone", "data"));
+        assert!(!rm(&[&format!("/{}", home.display()), &format!("{}/.", home.display())]));
+        // `~/~/notes` is the `notes` of a directory `~` in home, not home's.
+        t.write("home/~/notes", "gone");
+        t.write("home/notes", "kept");
+        assert!(rm(&[&remote_path("~/~/notes")]));
+        assert_eq!((home.join("~/notes").exists(), t.read("home/notes").as_str()), (false, "kept"));
+        // A link to home is only a link; a directory goes.
+        assert!(rm(&["link", "old", "-x"]));
+        assert!(home.join("link").symlink_metadata().is_err() && !home.join("old").exists());
+        assert!(!home.join("-x").exists());
+        assert_eq!(t.read("home/precious"), "data");
     }
 
     fn known() -> Vec<Known> {
@@ -2490,7 +2495,7 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            let script = unpack_script(&crate::shell::quote_always(&dest.display().to_string()), single);
+            let script = unpack_script(&crate::shell::quote_always(&dest.display().to_string()), single, false);
             let status = std::process::Command::new("sh")
                 .args(["-c", &script])
                 .stdin(tar.stdout.take().unwrap())
@@ -2515,6 +2520,132 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".kraal"))
         );
+    }
+
+    #[test]
+    fn a_broken_tar_stream_replaces_nothing() {
+        let t = Tmp::new("untar-broken");
+        t.write("src/d/x", "inner");
+        t.write("src/f", &"new\n".repeat(50_000));
+        t.write("out/f", "old");
+        t.write("out/d/kept", "theirs");
+        let stream = std::process::Command::new("tar")
+            .args(["cf", "-", "-C"])
+            .arg(t.dir.0.join("src"))
+            .args(["./d", "./f"])
+            .output()
+            .unwrap()
+            .stdout;
+        let out = t.dir.0.join("out");
+        let unpack_to = |dest: &Path, bytes: &[u8], single: Option<&str>, root: bool| {
+            let script = unpack_script(&crate::shell::quote_always(&dest.display().to_string()), single, root);
+            let mut sh = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let _ = std::io::Write::write_all(&mut sh.stdin.take().unwrap(), bytes);
+            sh.wait().unwrap().success()
+        };
+        let unpack = |bytes: &[u8], single: Option<&str>| unpack_to(&out, bytes, single, false);
+        let leftovers =
+            || std::fs::read_dir(&out).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".kraal"));
+        for single in [None, Some("f")] {
+            assert!(!unpack(&stream[..stream.len() / 2], single));
+            assert_eq!((t.read("out/f").as_str(), out.join("d/x").exists()), ("old", false));
+            assert!(!leftovers());
+        }
+        // Whole, it merges into the directories already there.
+        assert!(unpack(&stream, None));
+        assert_eq!((t.read("out/d/x").as_str(), t.read("out/d/kept").as_str()), ("inner", "theirs"));
+        assert_eq!(t.read("out/f").len(), 200_000);
+        assert!(!leftovers());
+        // Which take the archived modes, a read-only one once its files are in.
+        let chmod = |p: &str, m: u32| {
+            std::fs::set_permissions(t.dir.0.join(p), std::os::unix::fs::PermissionsExt::from_mode(m))
+        };
+        let mode = |p: &str| {
+            std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(t.dir.0.join(p)).unwrap().permissions())
+        };
+        t.write("src/d/sub/y", "deep");
+        std::fs::create_dir(t.dir.0.join("out/d/sub")).unwrap();
+        for (p, m) in [("src/d", 0o700), ("src/d/sub", 0o500), ("out/d", 0o755), ("out/d/sub", 0o755)] {
+            chmod(p, m).unwrap();
+        }
+        // An old time, which the copy must keep (`-t`: also BSD touch).
+        std::process::Command::new("touch").args(["-t", "200101010000"]).arg(t.dir.0.join("src/d")).status().unwrap();
+        let stream =
+            std::process::Command::new("tar").args(["cf", "-", "-C"]).arg(t.dir.0.join("src")).arg("./d").output();
+        let stream = stream.unwrap().stdout;
+        assert!(unpack(&stream, None));
+        assert_eq!((mode("out/d") & 0o7777, mode("out/d/sub") & 0o7777), (0o700, 0o500));
+        // And the archived time, though files went in.
+        let time = |p: &str| std::fs::metadata(t.dir.0.join(p)).unwrap().modified().unwrap();
+        assert_eq!(time("out/d"), time("src/d"));
+        assert_eq!((t.read("out/d/sub/y").as_str(), t.read("out/d/kept").as_str()), ("deep", "theirs"));
+        assert!(!leftovers());
+        // Again, into the read-only directory it made.
+        assert!(unpack(&stream, None));
+        assert_eq!(mode("out/d/sub") & 0o7777, 0o500);
+        // The contents of a directory (`d/`): the destination, new or not, takes its mode.
+        let contents =
+            std::process::Command::new("tar").args(["cf", "-", "-C"]).arg(t.dir.0.join("src/d")).arg(".").output();
+        let contents = contents.unwrap().stdout;
+        std::fs::create_dir(t.dir.0.join("open")).unwrap();
+        chmod("open", 0o755).unwrap();
+        // Only GNU tar gives the staging `.`'s mode: with another, `dest` keeps its own.
+        let gnu = std::process::Command::new("tar").arg("--version").output();
+        let gnu = gnu.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"));
+        for dest in ["fresh", "open"] {
+            assert!(unpack_to(&t.dir.0.join(dest), &contents, None, true));
+            assert_eq!(t.read(&format!("{dest}/sub/y")), "deep");
+            if gnu {
+                assert_eq!((mode(dest) & 0o7777, time(dest)), (0o700, time("src/d")));
+            }
+        }
+        assert_eq!(mode("open") & 0o7777, if gnu { 0o700 } else { 0o755 });
+        // A read-only one, twice: the second copy goes into what the first made read-only.
+        t.write("src/ro/z", "z");
+        chmod("src/ro", 0o500).unwrap();
+        let ro =
+            std::process::Command::new("tar").args(["cf", "-", "-C"]).arg(t.dir.0.join("src/ro")).arg(".").output();
+        let ro = ro.unwrap().stdout;
+        for _ in 0..2 {
+            assert!(unpack_to(&t.dir.0.join("ro"), &ro, None, true));
+            assert_eq!(t.read("ro/z"), "z");
+            assert!(!gnu || mode("ro") & 0o7777 == 0o500);
+            assert!(std::fs::read_dir(t.dir.0.join("ro")).unwrap().all(|e| e.unwrap().file_name() == "z"));
+        }
+        // A file takes the place of an empty directory, as with tar; never of one holding something.
+        t.write("src/e", "file");
+        std::fs::create_dir(t.dir.0.join("out/e")).unwrap();
+        let e = std::process::Command::new("tar").args(["cf", "-", "-C"]).arg(t.dir.0.join("src")).arg("./e").output();
+        let e = e.unwrap().stdout;
+        assert!(unpack(&e, None));
+        assert_eq!(t.read("out/e"), "file");
+        std::fs::remove_file(t.dir.0.join("out/e")).unwrap();
+        t.write("out/e/kept", "theirs");
+        assert!(!unpack(&e, None));
+        assert_eq!(t.read("out/e/kept"), "theirs");
+        // An archived 0400 directory (made by root, say): what it holds still goes in. Archived in
+        // two steps, as an archive of it could not go inside.
+        let tar = |args: &[&str]| assert!(std::process::Command::new("tar").args(args).status().unwrap().success());
+        let (src, q_tar) = (t.dir.0.join("src"), t.dir.0.join("q.tar"));
+        let (src, q_tar) = (src.to_str().unwrap(), q_tar.to_str().unwrap());
+        t.write("src/q/f", "new");
+        t.write("out/q/f", "old");
+        chmod("src/q", 0o400).unwrap();
+        tar(&["cf", q_tar, "-C", src, "--no-recursion", "./q"]);
+        chmod("src/q", 0o700).unwrap();
+        tar(&["rf", q_tar, "-C", src, "./q/f"]);
+        assert!(unpack(&std::fs::read(q_tar).unwrap(), None));
+        assert_eq!(mode("out/q") & 0o7777, 0o400);
+        chmod("out/q", 0o700).unwrap();
+        assert_eq!(t.read("out/q/f"), "new");
+        for p in ["src/d/sub", "out/d/sub", "fresh/sub", "open/sub", "src/ro", "ro"] {
+            chmod(p, 0o700).unwrap();
+        }
     }
 
     #[test]
@@ -2762,6 +2893,26 @@ mod tests {
         std::fs::remove_file(out.join("report")).unwrap();
         run(&plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap()).unwrap();
         assert!(theirs.exists());
+    }
+
+    #[test]
+    fn too_many_processes_to_list_keep_every_staging_of_this_boot() {
+        let Some(gone) = gone_owner() else { return };
+        let t = Tmp::new("many-processes");
+        let src = Endpoint::Local(t.write("in/report", "the report"));
+        let out = t.dir.0.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let dest = Endpoint::Local(t.dir.0.join("out/"));
+        let prefix = stage_prefix(std::slice::from_ref(&src), &dest);
+        let stage = made_stage(&out, &format!("{prefix}-{}", "e".repeat(32)), "copy", &gone);
+        // About 190 KiB of processes, more than one argument may hold.
+        MORE_PROCESSES.set("4000000:123456789 ".repeat(11_000));
+        let keep = Options { replace: Some(Vec::new()), ..Default::default() };
+        let steps = plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap();
+        assert!(steps.iter().all(|s| s.args.iter().all(|a| a.len() < 128 * 1024)));
+        run(&steps).unwrap();
+        assert_eq!(t.read("out/report"), "the report");
+        assert!(stage.exists(), "its maker may be among the processes not listed");
     }
 
     #[test]
@@ -3216,6 +3367,31 @@ mod tests {
     }
 
     #[test]
+    fn rsync_hands_ssh_its_options_as_they_are() {
+        if !crate::exec::have_program("rsync") {
+            return;
+        }
+        let t = Tmp::new("rsync-e");
+        std::fs::create_dir_all(t.dir.0.join("bin")).unwrap();
+        let seen = crate::shell::quote(&t.dir.0.join("seen").display().to_string());
+        crate::testing::write_script(&t.dir.0.join("bin/ssh"), &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {seen}\n"));
+        // A jump host with its own key, as servers.rs writes it.
+        let opts: Vec<String> =
+            ["-p", "2222", "-o", "ProxyCommand=ssh -i '/k e y' -W '[%h]:%p' \"jump\"", "-i", "/a\\b c", "it's"]
+                .map(String::from)
+                .to_vec();
+        let path = format!("{}:{}", t.dir.0.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+        let _ = std::process::Command::new("rsync")
+            .args(["-e", &ssh_e(&opts), "host:x"])
+            .env("PATH", path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let seen = t.read("seen");
+        assert_eq!(seen.lines().take(opts.len()).collect::<Vec<_>>(), opts, "{seen}");
+    }
+
+    #[test]
     fn local_tar_sources_are_found_whatever_came_before() {
         let src = [Endpoint::Local("a/one".into()), Endpoint::Local("b/two".into())];
         let step = pack_local(&src).unwrap();
@@ -3239,6 +3415,15 @@ mod tests {
         assert!(steps.unwrap()[0].args.contains(&".".to_string()));
         let v6 = parse_endpoint("[::1]:/tmp/x", &k).unwrap();
         assert!(matches!(&v6, Endpoint::Remote { server, path } if server.host == "::1" && path == "/tmp/x"), "{v6:?}");
+    }
+
+    #[test]
+    fn only_a_host_in_brackets_is_an_ipv6_address() {
+        assert_eq!(split_remote("db:/srv/a]:b"), Some(("db", "/srv/a]:b")));
+        assert_eq!(split_remote("user@[::1]:/x"), Some(("user@[::1]", "/x")));
+        assert_eq!(split_remote("[::1]:/srv/a]:b"), Some(("[::1]", "/srv/a]:b")));
+        let path = parse_endpoint("a:/srv/a]:b", &known()).unwrap();
+        assert!(matches!(&path, Endpoint::Remote { server, path } if server.name == "a" && path == "/srv/a]:b"));
     }
 
     #[test]
@@ -3383,79 +3568,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()), "tar cf - -C / .");
-    }
-
-    #[test]
-    fn dropped_paths_handle_local_uris_quotes_and_unique_raw_names_without_shell_expansion() {
-        let t = Tmp::new("dropped-paths");
-        let names =
-            ["notes client.txt", "single'quote", "double\"quote", "back\\slash", "$literal", "brackets[1]", "café.png"];
-        for name in names {
-            let path = t.dir.0.join(name);
-            std::fs::write(&path, b"x").unwrap();
-            assert_eq!(dropped_paths(&crate::shell::quote(path.to_str().unwrap())), Some(vec![path.clone()]));
-        }
-        let path = t.dir.0.join("notes client.txt");
-        assert_eq!(dropped_paths(path.to_str().unwrap()), Some(vec![path.clone()]));
-        let uri = format!("file://{}", path.display().to_string().replace(' ', "%20"));
-        assert_eq!(dropped_paths(&uri), Some(vec![path.clone()]));
-        assert_eq!(
-            dropped_paths(&format!("  '{uri}'\r\n'{}'\t", path.display())),
-            Some(vec![path.clone(), path.clone()])
-        );
-        for text in [
-            format!("cat {}", path.display()),
-            format!("{}\\", path.display()),
-            format!("'{}", path.display()),
-            format!("file://remote{}", path.display()),
-            format!("{uri}%"),
-            format!("{uri}%00"),
-            format!("{uri}?query"),
-            format!("{uri}#fragment"),
-            format!("{}/$literal", t.dir.0.display()),
-            format!("{}/brackets[1]", t.dir.0.display()),
-            "/$(touch /tmp/no)".into(),
-            "relative".into(),
-            String::new(),
-        ] {
-            assert_eq!(dropped_paths(&text), None, "{text}");
-        }
-        let a = t.dir.0.join("a");
-        let b = t.dir.0.join("b");
-        std::fs::write(&a, b"a").unwrap();
-        std::fs::write(&b, b"b").unwrap();
-        let text = format!("{} {}", a.display(), b.display());
-        let raw = PathBuf::from(&text);
-        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
-        std::fs::write(&raw, b"ambiguous").unwrap();
-        assert_eq!(dropped_paths(&text), None);
-        assert_eq!(dropped_paths(&format!("'{}' '{}'", a.display(), b.display())), Some(vec![a, b]));
-        assert_eq!(dropped_paths(&format!("'{text}'")), Some(vec![raw]));
-        let c = t.dir.0.join("c");
-        std::fs::write(&c, b"c").unwrap();
-        assert_eq!(dropped_paths(&format!("{text} {}", c.display())), None);
-        assert_eq!(dropped_paths(&format!("'{}' {text}", c.display())), None);
-        let backslash = t.dir.0.join("back\\slash");
-        assert_eq!(dropped_paths(&format!("\"{}\"", backslash.display())), Some(vec![backslash]));
-    }
-
-    #[test]
-    fn dropped_paths_parsing() {
-        let dir = std::env::temp_dir().join(format!("kraal drop {}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("it's here.txt");
-        std::fs::write(&f, "x").unwrap();
-        let escaped = f.display().to_string().replace(' ', "\\ ").replace('\'', "\\'");
-        assert_eq!(dropped_paths(&escaped), Some(vec![f.clone()]));
-        let quoted = format!("'{}' {}", dir.display(), escaped);
-        assert_eq!(dropped_paths(&quoted), Some(vec![dir.clone(), f.clone()]));
-        assert_eq!(dropped_paths("echo hello"), None);
-        assert_eq!(dropped_paths("relative/path"), None);
-        assert_eq!(
-            dropped_paths(&format!("file://{}", dir.display().to_string().replace(' ', "\\ "))),
-            Some(vec![dir.clone()])
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

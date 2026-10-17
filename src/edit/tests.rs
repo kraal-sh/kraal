@@ -949,6 +949,18 @@ fn as_root_through_sudo_the_password_is_given_once() {
     assert_eq!(s.open(&file.display().to_string()).unwrap().content, b"");
 }
 
+#[test]
+fn as_root_a_name_starting_with_a_dash_is_saved() {
+    let t = Here::with_sudo("sudo-dash");
+    std::fs::write(t.home().join(".nopasswd"), "").unwrap();
+    let file = t.home().join("-notes.conf");
+    std::fs::write(&file, "a\n").unwrap();
+    let mut s = t.session("~/-notes.conf").unwrap();
+    let opened = s.open(&s.path.clone()).unwrap();
+    assert!(matches!(s.save(&opened.file, &opened.identity, b"b\n").unwrap(), Saved::Written(_)));
+    assert_eq!(std::fs::read(&file).unwrap(), b"b\n");
+}
+
 /// The pane asking for the password hands it over through a FIFO, without a file on disk, and
 /// says when it was not given.
 #[test]

@@ -58,6 +58,7 @@ pub(super) struct TransferProgress {
     ascii: bool,
 }
 
+#[derive(Default)]
 struct Dropped {
     image: bool,
     shortcut: bool,

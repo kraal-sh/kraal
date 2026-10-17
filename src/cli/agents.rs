@@ -138,6 +138,14 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             }
             let action = if a.name == requested_name { "added" } else { "using existing account" };
             println!("{action} {} ({})", accounts::label(&a), paths::shorten_home(&paths::expand_tilde(&a.home)));
+            if verified {
+                // A forgotten account's directory is kept: adding its name again finds its sign-in.
+                println!(
+                    "  reusing the sign-in already in {}; `kraal accounts login {}` signs in again",
+                    paths::shorten_home(&paths::expand_tilde(&a.home)),
+                    accounts::key(&a.agent, &a.name)
+                );
+            }
             if no_login || verified {
                 return Ok(());
             }
@@ -550,8 +558,14 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                 if !inside.is_empty() && !force {
                     let names: Vec<String> =
                         inside.iter().map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string())).collect();
+                    // --force also deletes whatever the worktree has: say what.
+                    let lost = match git::worktree_state(&w) {
+                        Ok(state) if state.loses_nothing() => String::new(),
+                        Ok(state) => format!(" and deletes its {}", state.describe()),
+                        Err(_) => " and deletes whatever it has".into(),
+                    };
                     bail!(
-                        "panes work in {}: {} (close them, or --force closes them)",
+                        "panes work in {}: {} (close them, or --force closes them{lost})",
                         w.path.display(),
                         names.join(", ")
                     );

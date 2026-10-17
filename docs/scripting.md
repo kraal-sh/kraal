@@ -165,6 +165,9 @@ A key is an event type, or all those of a kind (`"agent.*"`); `kraal config chec
 is no event. The command runs through `sh -c`. `$KRAAL_EVENT` is the type; a field that is true
 is `1`, and one that is false or empty is the empty string. A hook can call kraal: it runs with
 the session's `KRAAL_SOCKET`, so `kraal read -p "$KRAAL_PANE"` reads the pane the event is about.
+`$KRAAL_SESSION` is the session's name, unless the event has a `session` field of its own (an
+agent on a server names the session it runs in there): the event's field wins. `KRAAL_SOCKET`,
+`KRAAL_EVENT_JSON` and `KRAAL_HOOK` are always kraal's, whatever the event's fields.
 [hooks.toml](../examples/config/hooks.toml) is this table as a file to copy.
 
 At most 20 hooks start per second and 32 run at once. A hook counts as running while any process

@@ -1,8 +1,7 @@
 //! Files served by the attached laptop, within its own configured scope.
 
 use std::ffi::{CStr, CString};
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -24,10 +23,8 @@ pub struct Identity {
 
 impl Identity {
     pub fn new() -> Result<Self> {
-        let mut bytes = [0u8; 16];
-        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(Self {
-            id: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            id: crate::identity::hex(&crate::identity::random_bytes::<16>()?),
             host: crate::context::hostname().unwrap_or_else(|| "laptop".into()).split('.').next().unwrap().into(),
             os: std::env::consts::OS.into(),
         })

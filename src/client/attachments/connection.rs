@@ -101,7 +101,8 @@ impl Controller {
                     target: target.chars().filter(|c| !c.is_control()).collect(),
                     limits,
                     text: String::new(),
-                    cursor: 0,
+                    // An image question selects Cancel: the server can open it while Enter is typed for a pane.
+                    cursor: usize::from(image),
                     error: None,
                     paste_failed: false,
                     parser,

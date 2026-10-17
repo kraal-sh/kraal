@@ -12,7 +12,7 @@ use crate::context::RemoteContexts;
 pub(super) const KRAAL_ANSWER: &str = "\x1b]7701;kraal\x07";
 
 pub(super) fn sanitize_title(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(120).collect()
+    s.chars().filter(|c| !c.is_control() && !crate::text::invisible(*c)).take(120).collect()
 }
 
 /// OSC sequences kraal itself cares about, picked out of the output stream. `Query` asks whether
@@ -174,7 +174,7 @@ pub(super) fn parse_osc(data: &[u8]) -> Option<Osc> {
 }
 
 pub(super) fn clean(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(300).collect()
+    s.chars().filter(|c| !c.is_control() && !crate::text::invisible(*c)).take(300).collect()
 }
 
 pub(super) fn percent_decode(s: &str) -> String {
@@ -303,5 +303,20 @@ mod tests {
                 at = end;
             }
         }
+    }
+
+    #[test]
+    fn titles_and_notifications_lose_bidi_controls_and_keep_joiners() {
+        let spoof = "\u{202e}cod.txt\u{2066}x\u{2069}\u{200f}\u{61c}\u{200b}\u{feff}";
+        assert_eq!(sanitize_title(spoof), "cod.txtx");
+        assert_eq!(
+            parse_osc(format!("777;notify;{spoof};{spoof}").as_bytes()),
+            Some(Osc::Notify { title: "cod.txtx".into(), body: "cod.txtx".into() })
+        );
+        // A family emoji (ZWJ) and Persian "mikhaham" (ZWNJ) stay whole.
+        let joined =
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}";
+        assert_eq!(sanitize_title(joined), joined);
+        assert_eq!(clean(joined), joined);
     }
 }

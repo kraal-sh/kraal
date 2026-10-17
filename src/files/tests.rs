@@ -160,7 +160,7 @@ fn remote_locations_join_parent_and_display() {
 fn local_paths_are_resolved() {
     assert_eq!(resolve_local(Path::new("/a/./b/../c/")), PathBuf::from("/a/c"));
     assert_eq!(resolve_local(Path::new("/..")), PathBuf::from("/"));
-    if let Some(home) = home_dir() {
+    if let Some(home) = crate::paths::home_dir() {
         assert_eq!(resolve_local(Path::new("~/x")), resolve_local(&home.join("x")));
     }
     assert!(resolve_local(Path::new("relative")).is_absolute());
