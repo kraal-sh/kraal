@@ -17,7 +17,7 @@ set -eu
 # Released clients, servers and saved state formats (docs/compatibility.md).
 RELEASES="v0.2.0 v0.3.0 v0.4.0 v0.4.1"
 
-repo=kraal-sh/kraal
+repo=vodhash/kraal
 root=$(cd "$(dirname "$0")/.." && pwd)
 dir=${KRAAL_COMPAT_DIR:-$root/target/compat}
 

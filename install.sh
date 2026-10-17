@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install kraal from its GitHub releases, for Linux and macOS:
 #
-#   curl -fsSL https://raw.githubusercontent.com/kraal-sh/kraal/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/vodhash/kraal/main/install.sh | sh
 #
 # The archive's checksum is checked before anything is installed. Settings:
 #   KRAAL_VERSION       a release tag such as v0.1.0 (the latest by default)
@@ -9,7 +9,7 @@
 #   KRAAL_DOWNLOAD_URL  where the archives are, instead of GitHub (a mirror)
 set -eu
 
-repo="kraal-sh/kraal"
+repo="vodhash/kraal"
 version="${KRAAL_VERSION:-latest}"
 dir="${KRAAL_INSTALL_DIR:-$HOME/.local/bin}"
 

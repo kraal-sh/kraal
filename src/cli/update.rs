@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-const REPO: &str = "kraal-sh/kraal";
+const REPO: &str = "vodhash/kraal";
 const DOWNLOAD: Duration = Duration::from_secs(300);
 
 /// `restart`: what to do with the sessions left on an older kraal (`None`: ask).
@@ -204,8 +204,8 @@ mod tests {
 
     #[test]
     fn releases_and_tags() {
-        assert_eq!(tag_in("https://github.com/kraal-sh/kraal/releases/tag/v0.2.0\n").as_deref(), Some("v0.2.0"));
-        assert_eq!(tag_in("https://github.com/kraal-sh/kraal/releases"), None);
+        assert_eq!(tag_in("https://github.com/vodhash/kraal/releases/tag/v0.2.0\n").as_deref(), Some("v0.2.0"));
+        assert_eq!(tag_in("https://github.com/vodhash/kraal/releases"), None);
         assert_eq!(version_of("v0.2.0"), "0.2.0");
         assert!(release_url(Some("v0.2.0")).ends_with("/releases/download/v0.2.0"));
         assert!(release_url(None).ends_with("/releases/latest/download"));
