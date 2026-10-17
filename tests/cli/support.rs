@@ -1022,7 +1022,7 @@ pub(super) fn fake_ssh(local: &Env, remote: &Env) -> (PathBuf, String) {
     write_script(
         &bin.join("ssh"),
         &format!(
-            "#!/bin/sh\necho \"$*\" >> {log}\nfor a; do cmd=$a; done\n\
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nfor a; do cmd=$a; done\n\
              case \"$*\" in *down.lan*) echo 'ssh: connect to host down.lan port 22: Connection refused' >&2; exit 255;; esac\n\
              unset KRAAL KRAAL_SOCKET KRAAL_SESSION KRAAL_PANE\n\
              export HOME={r}/home XDG_RUNTIME_DIR={r}/run XDG_STATE_HOME={r}/state XDG_CONFIG_HOME={r}/config\n\

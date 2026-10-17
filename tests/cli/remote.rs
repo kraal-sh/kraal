@@ -466,7 +466,7 @@ fn an_ssh_pane_keeps_the_account_it_was_opened_with() {
     write_script(
         &bin.join("ssh"),
         &format!(
-            "#!/bin/sh\necho \"$*\" >> {}\nfor a; do cmd=$a; done\ncase $cmd in *' '*) exec sh -c \"$cmd\";; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nfor a; do cmd=$a; done\ncase $cmd in *' '*) exec sh -c \"$cmd\";; esac\nexit 0\n",
             log.display()
         ),
     );
