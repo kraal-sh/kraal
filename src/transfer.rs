@@ -2195,7 +2195,11 @@ mod tests {
         let right = steps[0].pipe_to.as_ref().unwrap();
         assert!(right.args.windows(2).any(|w| w == ["-p", "2222"]), "{:?}", right.args);
         // One file to a name that is not a directory there: it takes that name, as with rsync.
-        assert!(right.args.last().unwrap().contains("if [ -d /srv/in ]"), "{:?}", right.args);
+        assert!(
+            crate::shell::unwrap_sh_c(right.args.last().unwrap()).contains("if [ -d /srv/in ]"),
+            "{:?}",
+            right.args
+        );
         // Relative sources are taken from home, each on its own (a relative -C would chain).
         let rel = [parse_endpoint("a:logs/x", &k).unwrap(), parse_endpoint("a:conf/y", &k).unwrap()];
         let steps = plan(&rel, &dest, &opts, &with_rsync(true)).unwrap();
